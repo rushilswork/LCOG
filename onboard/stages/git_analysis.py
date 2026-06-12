@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from git import InvalidGitRepositoryError, Repo
+from git import GitCommandError, GitCommandNotFound, InvalidGitRepositoryError, Repo
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ class RepoHistory:
     files: dict[str, FileHistory] = field(default_factory=dict)
     total_commits: int = 0
     active_authors: list[str] = field(default_factory=list)
-    major_themes: list[str] = field(default_factory=list)   # from commit clustering
+    major_themes: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -52,44 +52,57 @@ DEAD_CODE_THRESHOLD_DAYS = 730   # ~2 years
 
 
 def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
-    """Analyse the git history of *repo_path* and return a RepoHistory."""
+    """Analyse the git history of *repo_path* and return a RepoHistory.
+
+    Returns an empty RepoHistory if the directory is not a git repo, has no
+    commits, or git is not installed -- so the pipeline degrades gracefully.
+    """
     try:
         repo = Repo(repo_path, search_parent_directories=True)
     except InvalidGitRepositoryError:
+        return RepoHistory()
+    except Exception:
+        return RepoHistory()
+
+    # Bare repos have no working tree -- skip gracefully
+    if repo.bare:
         return RepoHistory()
 
     history = RepoHistory()
     now = datetime.now(tz=timezone.utc)
 
-    # Commit file-change map: commit → set of touched files
     commit_files: dict[str, set[str]] = {}
     author_counter: Counter = Counter()
     all_messages: list[str] = []
 
-    # Per-file tracking
     file_commits: dict[str, list] = defaultdict(list)
     file_authors: dict[str, Counter] = defaultdict(Counter)
     file_messages: dict[str, list[str]] = defaultdict(list)
     file_last_ts: dict[str, float] = {}
 
-    commits = list(repo.iter_commits("HEAD", max_count=max_commits))
+    try:
+        commits = list(repo.iter_commits("HEAD", max_count=max_commits))
+    except (GitCommandError, GitCommandNotFound, ValueError):
+        # Empty repo, no HEAD, or git binary missing
+        return RepoHistory()
+
     history.total_commits = len(commits)
 
     for commit in commits:
-        author = commit.author.name or "unknown"
+        author = (commit.author.name or "unknown") if commit.author else "unknown"
         author_counter[author] += 1
-        msg = commit.message.strip().split("\n")[0]  # first line only
+        msg = (commit.message or "").strip().split("\n")[0]
         all_messages.append(msg)
 
         touched: set[str] = set()
         try:
-            # diff against first parent to get changed files
             if commit.parents:
                 diff = commit.parents[0].diff(commit)
             else:
-                diff = commit.diff(None)  # initial commit
+                diff = commit.diff(None)
             for d in diff:
                 fpath = d.b_path or d.a_path
+                # gitpython always returns forward-slash paths
                 if fpath:
                     touched.add(fpath)
         except Exception:
@@ -97,11 +110,15 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
 
         commit_files[commit.hexsha] = touched
 
+        try:
+            ts = commit.committed_datetime.timestamp()
+        except Exception:
+            ts = 0.0
+
         for fpath in touched:
             file_commits[fpath].append(commit)
             file_authors[fpath][author] += 1
             file_messages[fpath].append(msg)
-            ts = commit.committed_date
             if fpath not in file_last_ts or ts > file_last_ts[fpath]:
                 file_last_ts[fpath] = ts
 
@@ -114,7 +131,6 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
                 co_change[fa][fb] += 1
                 co_change[fb][fa] += 1
 
-    # Assemble FileHistory per file
     for fpath, commits_list in file_commits.items():
         last_ts = file_last_ts.get(fpath)
         if last_ts:
@@ -123,7 +139,7 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
             last_modified_days = None
 
         top_authors = file_authors[fpath].most_common(3)
-        msgs = file_messages[fpath][:10]  # keep top-10 messages
+        msgs = file_messages[fpath][:10]
 
         fh = FileHistory(
             path=fpath,
@@ -145,7 +161,7 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
 
 
 # ---------------------------------------------------------------------------
-# Commit message clustering (simple keyword extraction — no heavy ML dep)
+# Commit message clustering
 # ---------------------------------------------------------------------------
 
 _STOP_WORDS = {
@@ -159,7 +175,7 @@ def _cluster_messages(messages: list[str], top_n: int = 10) -> list[str]:
     """Return the top-N recurring noun-like tokens across all commit messages."""
     counter: Counter = Counter()
     for msg in messages:
-        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{2,}", msg.lower())
+        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", msg.lower())
         for tok in tokens:
             if tok not in _STOP_WORDS:
                 counter[tok] += 1

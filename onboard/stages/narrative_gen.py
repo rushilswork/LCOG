@@ -19,6 +19,7 @@ Also produces:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -120,11 +121,55 @@ def _imports_summary(imports: list[str], max_items: int = 15) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Provider-agnostic LLM call
+# Section extraction (defined once, not inside the generation loop)
 # ---------------------------------------------------------------------------
 
+def _extract_section(text: str, heading: str) -> str:
+    """Extract the content of a ## heading from an LLM response."""
+    tag = f"## {heading}"
+    start = text.find(tag)
+    if start == -1:
+        return ""
+    start = text.find("\n", start) + 1
+    end = text.find("## ", start)
+    return text[start:end].strip() if end != -1 else text[start:].strip()
+
+
+# ---------------------------------------------------------------------------
+# Provider-agnostic LLM call with retry
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_SIGNALS = ("rate_limit", "429", "too many", "quota", "resource_exhausted")
+_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE = 5  # seconds; doubles each attempt
+
+
 def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: int) -> str:
-    """Call the specified LLM provider and return the response text."""
+    """Call the specified LLM provider and return the response text.
+
+    Retries up to _MAX_RETRIES times on rate-limit / transient errors with
+    exponential backoff.  Raises on non-retriable errors or exhausted retries.
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return _call_llm_once(prompt, provider, api_key, model, max_tokens)
+        except Exception as exc:
+            last_exc = exc
+            err_lower = str(exc).lower()
+            is_retriable = any(sig in err_lower for sig in _RATE_LIMIT_SIGNALS)
+            if is_retriable and attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
+
+
+def _call_llm_once(prompt: str, provider: str, api_key: str, model: str, max_tokens: int) -> str:
+    """Single (non-retried) LLM call."""
     if provider == "groq":
         from groq import Groq
         client = Groq(api_key=api_key)
@@ -140,6 +185,10 @@ def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: 
         genai.configure(api_key=api_key)
         gemini_model = genai.GenerativeModel(model)
         resp = gemini_model.generate_content(prompt)
+        # Gemini may block a response due to safety filters
+        if not resp.parts:
+            reason = getattr(resp.prompt_feedback, "block_reason", "unknown")
+            raise ValueError(f"Gemini blocked the response (reason: {reason})")
         return resp.text.strip()
 
     else:
@@ -304,16 +353,10 @@ def generate_guide(
         try:
             raw = _call_llm(prompt, provider, api_key, model, max_tokens)
         except Exception as e:
-            raw = f"*Narrative generation failed: {e}*"
-
-        def _section(text: str, heading: str) -> str:
-            tag = f"## {heading}"
-            start = text.find(tag)
-            if start == -1:
-                return ""
-            start = text.find("\n", start) + 1
-            end = text.find("## ", start)
-            return text[start:end].strip() if end != -1 else text[start:].strip()
+            # Sanitize the error — strip the API key if it appears in the message
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            raw = f"*Narrative generation failed: {err_msg}*"
+            log(f"    [warning] {err_msg}")
 
         dead_warn = None
         if fh and fh.is_dead_code_candidate:
@@ -338,10 +381,10 @@ def generate_guide(
         guide.modules[path] = ModuleNarrative(
             path=path,
             title=mod_title,
-            summary=_section(raw, "What this module does") or raw[:300],
-            walkthrough=_section(raw, "How it fits into the system"),
-            design_notes=_section(raw, "Key design decisions"),
-            pitfalls=_section(raw, "Pitfalls to avoid"),
+            summary=_extract_section(raw, "What this module does") or raw[:300],
+            walkthrough=_extract_section(raw, "How it fits into the system"),
+            design_notes=_extract_section(raw, "Key design decisions"),
+            pitfalls=_extract_section(raw, "Pitfalls to avoid"),
             dead_code_warning=dead_warn,
             hotspot_warning=hotspot_warn,
             reading_order_index=idx,
@@ -357,7 +400,7 @@ def generate_guide(
 
     overview_prompt = OVERVIEW_PROMPT.format(
         total_files=graph.number_of_nodes(),
-        languages=", ".join(set(d.get("language", "?") for _, d in graph.nodes(data=True))),
+        languages=", ".join(sorted({d.get("language", "?") for _, d in graph.nodes(data=True)})),
         entry_points=", ".join(entry_points[:5]) or "none detected",
         hotspots=hotspots_text,
         themes=", ".join(history.major_themes[:10]),
@@ -368,17 +411,19 @@ def generate_guide(
     try:
         guide.system_overview = _call_llm(overview_prompt, provider, api_key, model, max_tokens)
     except Exception as e:
-        guide.system_overview = f"*Overview generation failed: {e}*"
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        guide.system_overview = f"*Overview generation failed: {err_msg}*"
 
     # Guided tour
     tour_parts = ["# Guided Tour\n\nFollow this sequence to build a mental model of the codebase.\n"]
     for idx, path in enumerate(reading_order[:15]):
         mod = guide.modules.get(path)
         if mod:
-            slug = path.replace("/", "_").replace(".", "_")
+            import re as _re
+            slug = _re.sub(r"[^\w\-]", "_", path)
             tour_parts.append(
                 f"\n## Step {idx + 1}: `{path}`\n\n{mod.summary}\n\n"
-                f"-> [Full walkthrough](modules/{slug}.md)\n"
+                f"-> [Full walkthrough](modules/{slug}/)\n"
             )
     guide.guided_tour = "\n".join(tour_parts)
 

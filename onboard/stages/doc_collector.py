@@ -11,10 +11,22 @@ Each fragment is linked to a source file path and optional line range.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Shared ignore set
+# ---------------------------------------------------------------------------
+
+_IGNORE_DIRS = {
+    ".git", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    "env", "dist", "build", ".next", "target", ".gradle",
+    "onboarding-guide",  # skip previously generated output
+}
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +35,7 @@ from typing import Optional
 
 @dataclass
 class DocFragment:
-    source_file: str          # relative path
+    source_file: str          # relative path (forward slashes)
     kind: str                 # "readme" | "docstring" | "comment" | "changelog" | "arch_doc"
     content: str
     start_line: Optional[int] = None
@@ -57,22 +69,30 @@ README_NAMES = {
     "overview.md", "hacking.md",
 }
 
+_PROSE_EXTS = {".md", ".rst"}   # .txt excluded — too many false positives
+
 
 def _collect_prose_docs(repo_path: Path, corpus: DocCorpus) -> None:
-    for p in repo_path.rglob("*"):
-        if p.is_dir():
-            continue
-        if p.name.lower() in README_NAMES or p.suffix.lower() in (".md", ".rst", ".txt"):
-            # Skip very large files
+    """Walk repo, collecting README / architecture / changelog prose."""
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        # Prune ignored dirs in-place so os.walk won't descend into them
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
+
+        for filename in filenames:
+            name_lower = filename.lower()
+            suffix = Path(filename).suffix.lower()
+            if name_lower not in README_NAMES and suffix not in _PROSE_EXTS:
+                continue
+
+            abs_path = Path(dirpath) / filename
             try:
-                size_kb = p.stat().st_size / 1024
+                size_kb = abs_path.stat().st_size / 1024
                 if size_kb > 200:
                     continue
-                content = p.read_text(encoding="utf-8", errors="replace")
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
 
-            name_lower = p.name.lower()
             if any(kw in name_lower for kw in ("arch", "design", "overview")):
                 kind = "arch_doc"
             elif any(kw in name_lower for kw in ("change", "history")):
@@ -80,7 +100,11 @@ def _collect_prose_docs(repo_path: Path, corpus: DocCorpus) -> None:
             else:
                 kind = "readme"
 
-            rel = str(p.relative_to(repo_path))
+            try:
+                rel = abs_path.relative_to(repo_path).as_posix()
+            except ValueError:
+                continue
+
             corpus.fragments.append(DocFragment(
                 source_file=rel,
                 kind=kind,
@@ -189,33 +213,33 @@ def collect_docs(repo_path: Path) -> DocCorpus:
     # Prose / README files
     _collect_prose_docs(repo_path, corpus)
 
-    ignore_dirs = {
-        ".git", "__pycache__", "node_modules", ".venv", "venv",
-        "env", "dist", "build", ".next", "target",
-    }
+    # Source-file inline docs — use os.walk so we can prune dirs
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
 
-    for p in repo_path.rglob("*"):
-        if p.is_dir():
-            continue
-        if any(part in ignore_dirs for part in p.parts):
-            continue
-        if p.suffix.lower() not in SOURCE_EXTS:
-            continue
-        try:
-            if p.stat().st_size / 1024 > 300:
+        for filename in filenames:
+            if Path(filename).suffix.lower() not in SOURCE_EXTS:
                 continue
-            source = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
 
-        rel = str(p.relative_to(repo_path))
-        ext = p.suffix.lower()
+            abs_path = Path(dirpath) / filename
+            try:
+                if abs_path.stat().st_size / 1024 > 300:
+                    continue
+                source = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
 
-        if ext == ".py":
-            _collect_python_docstrings(rel, source, corpus)
-        elif ext in (".js", ".mjs", ".ts", ".tsx"):
-            _collect_jsdoc(rel, source, corpus)
-        elif ext in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".java"):
-            _collect_doxygen(rel, source, corpus)
+            try:
+                rel = abs_path.relative_to(repo_path).as_posix()
+            except ValueError:
+                continue
+
+            ext = abs_path.suffix.lower()
+            if ext == ".py":
+                _collect_python_docstrings(rel, source, corpus)
+            elif ext in (".js", ".mjs", ".ts", ".tsx"):
+                _collect_jsdoc(rel, source, corpus)
+            elif ext in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".java"):
+                _collect_doxygen(rel, source, corpus)
 
     return corpus

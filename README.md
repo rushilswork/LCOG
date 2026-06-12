@@ -15,7 +15,7 @@ The output is a static site with:
 - A suggested reading order — dependencies first, hotspots surfaced early
 - A per-module page: what it does, how it fits, design decisions, pitfalls
 - Dead code callouts (files untouched for 2+ years)
-- Hotspot warnings (files that change constantly)
+- Hotspot warnings (files that change constantly — add tests before touching)
 - A guided tour that walks through the whole codebase in sequence
 - Full-text search
 
@@ -26,27 +26,39 @@ The output is a static site with:
 Four stages run in sequence:
 
 **Stage 1 — Static analysis**
-Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, C/C++, and Java. Builds a directed dependency graph.
+Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, C/C++, and Java. Builds a directed dependency graph. Files larger than 500 KB and standard noise directories (`node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.) are skipped automatically.
 
 **Stage 2 — Git history**
-Reads the git log to compute change frequency per file, co-change coupling (files that always change together), author ownership, and recurring themes from commit messages.
+Reads the git log to compute change frequency per file, co-change coupling (files that always change together), author ownership, and recurring themes from commit messages. Degrades gracefully on repos with no history, bare repos, or missing git.
 
 **Stage 3 — Doc collection**
-Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the files they describe.
+Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the files they describe. Restricts prose collection to `.md` and `.rst` to avoid false positives.
 
 **Stage 4 — LLM narratives** *(skipped with --skip-llm)*
-Sends each module's structure + history + docs to an LLM. Gets back a walkthrough covering what the module does, how it connects to the rest of the system, key design decisions, patterns to follow, and what to watch out for.
+Sends each module's structure + history + docs to an LLM. Gets back a walkthrough covering what the module does, how it connects to the rest of the system, key design decisions, patterns to follow, and what to watch out for. Rate-limit errors are retried with exponential backoff.
 
 ---
 
 ## Setup
+
+Requires Python 3.10+.
 
 ```bash
 pip install -e .
 pip install mkdocs-material
 ```
 
-Requires Python 3.10+.
+Install tree-sitter language bindings for the languages in your repo:
+
+```bash
+pip install tree-sitter-python          # Python
+pip install tree-sitter-javascript      # JavaScript
+pip install tree-sitter-typescript      # TypeScript
+pip install tree-sitter-cpp             # C / C++
+pip install tree-sitter-java            # Java
+```
+
+You only need bindings for languages actually present in the target repo. Missing bindings are skipped silently.
 
 ---
 
@@ -54,16 +66,16 @@ Requires Python 3.10+.
 
 ### Without AI (no API key needed)
 
-Stages 1-3 run. You get the full interactive dependency graph, static Mermaid graph, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages show stubs instead of LLM prose.
+Stages 1–3 run. You get the full interactive dependency graph, static Mermaid graph, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages show stubs instead of LLM prose.
 
 ```bash
-onboard analyze C:\path\to\repo --skip-llm
+onboard analyze /path/to/repo --skip-llm
 ```
 
-The guide is written to `<repo>\onboarding-guide` by default. Then serve it:
+The guide is written to `<repo>/onboarding-guide` by default. Then serve it:
 
 ```bash
-cd C:\path\to\repo\onboarding-guide
+cd /path/to/repo/onboarding-guide
 mkdocs serve
 ```
 
@@ -73,32 +85,38 @@ Open `http://127.0.0.1:8000`.
 
 ### With AI (full output)
 
-Stages 1-4 all run. The LLM writes actual narratives for every module, a system overview, and a guided tour.
+Stages 1–4 all run. The LLM writes actual narratives for every module, a system overview, and a guided tour.
 
-**Option 1: Groq** (default — fast, free, no card required)
+**Option 1: Groq** (default — fast, free tier available, no card required)
 
 1. Sign up at [console.groq.com](https://console.groq.com) and create an API key.
 2. Run:
 
 ```bash
-set GROQ_API_KEY=gsk_...        # Windows
-export GROQ_API_KEY=gsk_...     # Mac/Linux
-
+# Windows
+set GROQ_API_KEY=gsk_...
 onboard analyze C:\path\to\repo
 cd C:\path\to\repo\onboarding-guide && mkdocs serve
+
+# Mac / Linux
+export GROQ_API_KEY=gsk_...
+onboard analyze /path/to/repo
+cd /path/to/repo/onboarding-guide && mkdocs serve
 ```
 
-**Option 2: Gemini** (also free, no card required)
+**Option 2: Gemini** (free tier available, no card required)
 
 1. Sign up at [aistudio.google.com](https://aistudio.google.com) and create an API key.
 2. Run:
 
 ```bash
-set GEMINI_API_KEY=AIza...      # Windows
-export GEMINI_API_KEY=AIza...   # Mac/Linux
-
+# Windows
+set GEMINI_API_KEY=AIza...
 onboard analyze C:\path\to\repo --provider gemini
-cd C:\path\to\repo\onboarding-guide && mkdocs serve
+
+# Mac / Linux
+export GEMINI_API_KEY=AIza...
+onboard analyze /path/to/repo --provider gemini
 ```
 
 ---
@@ -130,7 +148,7 @@ onboard analyze <repo_path> [OPTIONS]
 To serve an already-generated guide without regenerating:
 
 ```bash
-onboard serve C:\path\to\repo\onboarding-guide
+onboard serve /path/to/repo/onboarding-guide
 ```
 
 ---
@@ -153,4 +171,19 @@ Click any node to open that module's page.
 
 - If you hit rate limits on a large repo, use `--max-modules 20` on the first run and increase from there.
 - Re-run the same command against the same repo to refresh the guide as the codebase changes. The output directory is overwritten in place.
-- The guide is excluded from tree-sitter analysis via the `onboarding-guide` ignore rule, so running the tool on its own repo won't recurse.
+- The `onboarding-guide` output directory is excluded from analysis, so running the tool on its own repo won't recurse.
+- Repos with no git history, bare repos, or repos on machines without git installed all run fine — Stage 2 degrades gracefully and returns empty history.
+
+---
+
+## Troubleshooting
+
+**`ModuleNotFoundError: No module named 'tree_sitter_python'`** — install the binding: `pip install tree-sitter-python`. Only install bindings for languages you need.
+
+**`onboard: command not found`** — run `pip install -e .` from the repo root, or invoke directly with `python -m onboard`.
+
+**Rate limit errors (429)** — Stage 4 retries automatically with backoff. If a model is consistently throttled, try `--provider gemini` or reduce `--max-modules`.
+
+**Module pages show stubs** — you ran with `--skip-llm`. Re-run without the flag and with a valid API key to get full narratives.
+
+**Windows encoding errors in terminal** — set `PYTHONUTF8=1` before running: `set PYTHONUTF8=1 && onboard analyze ...`
