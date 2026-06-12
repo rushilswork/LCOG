@@ -233,7 +233,13 @@ def analyze(
     console.print(f"   [dim]cd {output} && mkdocs serve[/dim]\n")
 
     if serve:
-        subprocess.run(["mkdocs", "serve"], cwd=output, check=False)
+        try:
+            subprocess.run(["mkdocs", "serve"], cwd=output, check=False)
+        except FileNotFoundError:
+            console.print(
+                "[red]Error:[/red] mkdocs not found. "
+                "Run: pip install mkdocs-material"
+            )
 
 
 @main.command()
@@ -242,7 +248,13 @@ def analyze(
 def serve(guide_dir: Path):
     """Serve an existing onboarding guide with MkDocs."""
     console.print(f"Serving [bold]{guide_dir}[/bold]...")
-    subprocess.run(["mkdocs", "serve"], cwd=guide_dir, check=False)
+    try:
+        subprocess.run(["mkdocs", "serve"], cwd=guide_dir, check=False)
+    except FileNotFoundError:
+        console.print(
+            "[red]Error:[/red] mkdocs not found. "
+            "Run: pip install mkdocs-material"
+        )
 
 
 if __name__ == "__main__":

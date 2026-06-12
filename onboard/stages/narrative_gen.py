@@ -19,6 +19,7 @@ Also produces:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -378,53 +379,4 @@ def generate_guide(
         else:
             mod_title = stem.replace("_", " ").replace("-", " ").title()
 
-        guide.modules[path] = ModuleNarrative(
-            path=path,
-            title=mod_title,
-            summary=_extract_section(raw, "What this module does") or raw[:300],
-            walkthrough=_extract_section(raw, "How it fits into the system"),
-            design_notes=_extract_section(raw, "Key design decisions"),
-            pitfalls=_extract_section(raw, "Pitfalls to avoid"),
-            dead_code_warning=dead_warn,
-            hotspot_warning=hotspot_warn,
-            reading_order_index=idx,
-        )
-
-    # System overview
-    log("Generating system overview...")
-    hotspots_text = "\n".join(
-        f"  {p} ({h.change_frequency} commits)"
-        for p, h in sorted(history.files.items(), key=lambda kv: -kv[1].change_frequency)[:10]
-    )
-    arch_docs_text = "\n\n".join(f.content[:500] for f in corpus.arch_docs()[:2]) or "None found."
-
-    overview_prompt = OVERVIEW_PROMPT.format(
-        total_files=graph.number_of_nodes(),
-        languages=", ".join(sorted({d.get("language", "?") for _, d in graph.nodes(data=True)})),
-        entry_points=", ".join(entry_points[:5]) or "none detected",
-        hotspots=hotspots_text,
-        themes=", ".join(history.major_themes[:10]),
-        arch_docs=arch_docs_text,
-        reading_order="\n".join(f"  {i+1}. {p}" for i, p in enumerate(reading_order[:15])),
-    )
-
-    try:
-        guide.system_overview = _call_llm(overview_prompt, provider, api_key, model, max_tokens)
-    except Exception as e:
-        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-        guide.system_overview = f"*Overview generation failed: {err_msg}*"
-
-    # Guided tour
-    tour_parts = ["# Guided Tour\n\nFollow this sequence to build a mental model of the codebase.\n"]
-    for idx, path in enumerate(reading_order[:15]):
-        mod = guide.modules.get(path)
-        if mod:
-            import re as _re
-            slug = _re.sub(r"[^\w\-]", "_", path)
-            tour_parts.append(
-                f"\n## Step {idx + 1}: `{path}`\n\n{mod.summary}\n\n"
-                f"-> [Full walkthrough](modules/{slug}.md)\n"
-            )
-    guide.guided_tour = "\n".join(tour_parts)
-
-    return guide
+        guide.modules[path] = ModuleNarrativ

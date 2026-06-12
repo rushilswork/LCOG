@@ -124,7 +124,6 @@ def _build_interactive_graph(graph: nx.DiGraph) -> str:
     nc = graph.number_of_nodes()
     ec = graph.number_of_edges()
 
-    # Build HTML using string concatenation to avoid f-string brace escaping issues
     html = (
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         '<meta charset="utf-8">\n<title>Dependency Graph</title>\n'
@@ -337,37 +336,44 @@ def _build_interactive_graph(graph: nx.DiGraph) -> str:
     return html
 
 
-def _build_mkdocs_yml(site_name: str, output_dir: Path, module_paths: list) -> str:
+def _build_mkdocs_yml(site_name: str, module_paths: list) -> str:
+    """Build mkdocs.yml content.  output_dir removed — unused."""
     def _nav_title(p: str) -> str:
         stem = Path(p).stem
         if stem == "__init__" and Path(p).parent != Path("."):
             return Path(p).parent.name.replace("_", " ").title() + " (init)"
         return stem.replace("_", " ").title()
 
-    raw_titles = [_nav_title(p) for p in module_paths]
-    title_counts = Counter(raw_titles)
-    seen_used: dict = {}
-    final_titles = []
-    for t, p in zip(raw_titles, module_paths):
-        if title_counts[t] > 1:
-            pkg = Path(p).parent.name
-            t = f"{t} ({pkg})" if pkg and pkg != "." else t
-        if t in seen_used:
-            seen_used[t] += 1
-            t = f"{t} {seen_used[t]}"
-        else:
-            seen_used[t] = 0
-        final_titles.append(t)
+    # Build nav modules section only if there are modules
+    if module_paths:
+        raw_titles = [_nav_title(p) for p in module_paths]
+        title_counts = Counter(raw_titles)
+        seen_used: dict = {}
+        final_titles = []
+        for t, p in zip(raw_titles, module_paths):
+            if title_counts[t] > 1:
+                pkg = Path(p).parent.name
+                t = f"{t} ({pkg})" if pkg and pkg != "." else t
+            if t in seen_used:
+                seen_used[t] += 1
+                t = f"{t} {seen_used[t]}"
+            else:
+                seen_used[t] = 0
+            final_titles.append(t)
 
-    nav_modules_list = [
-        {title: f"modules/{_slugify(p)}.md"}
-        for title, p in zip(final_titles, module_paths)
-    ]
-    nav_modules_yaml = yaml.dump(nav_modules_list, default_flow_style=False, allow_unicode=True)
-    nav_modules_indented = "\n".join(
-        "      " + line if line.strip() else ""
-        for line in nav_modules_yaml.splitlines()
-    )
+        nav_modules_list = [
+            {title: f"modules/{_slugify(p)}.md"}
+            for title, p in zip(final_titles, module_paths)
+        ]
+        nav_modules_yaml = yaml.dump(nav_modules_list, default_flow_style=False, allow_unicode=True)
+        nav_modules_indented = "\n".join(
+            "      " + line if line.strip() else ""
+            for line in nav_modules_yaml.splitlines()
+        )
+        modules_nav = "  - Modules:\n" + nav_modules_indented + "\n"
+    else:
+        modules_nav = ""
+
     safe_name = site_name.replace("'", "''")
     return (
         f"site_name: '{safe_name}'\n"
@@ -401,8 +407,7 @@ def _build_mkdocs_yml(site_name: str, output_dir: Path, module_paths: list) -> s
         "nav:\n"
         "  - Home: index.md\n"
         "  - Guided Tour: guided_tour.md\n"
-        "  - Modules:\n"
-        + nav_modules_indented + "\n"
+        + modules_nav
     )
 
 
@@ -430,7 +435,7 @@ def build_site(guide: OnboardingGuide, graph: nx.DiGraph,
 
     (docs_dir / "graph.html").write_text(_build_interactive_graph(graph), encoding="utf-8")
 
-    yml = _build_mkdocs_yml(site_name, output_dir, list(guide.modules.keys()))
+    yml = _build_mkdocs_yml(site_name, list(guide.modules.keys()))
     (output_dir / "mkdocs.yml").write_text(yml, encoding="utf-8")
 
     print(f"MkDocs site written to {output_dir}")
