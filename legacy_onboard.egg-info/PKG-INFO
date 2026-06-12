@@ -3,7 +3,8 @@ Name: legacy-onboard
 Version: 0.1.0
 Summary: Generate structured onboarding guides for legacy codebases
 Requires-Python: >=3.10
-Requires-Dist: anthropic>=0.26.0
+Requires-Dist: groq>=0.9.0
+Requires-Dist: google-generativeai>=0.7.0
 Requires-Dist: click>=8.1
 Requires-Dist: gitpython>=3.1
 Requires-Dist: tree-sitter>=0.22
@@ -18,5 +19,4 @@ Requires-Dist: jinja2>=3.1
 Requires-Dist: mkdocs>=1.5
 Requires-Dist: mkdocs-material>=9.5
 Requires-Dist: pymdown-extensions>=10.0
-Requires-Dist: scikit-learn>=1.4
 Requires-Dist: pyyaml>=6.0

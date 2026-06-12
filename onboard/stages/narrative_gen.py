@@ -329,9 +329,15 @@ def generate_guide(
                 "Add tests before modifying."
             )
 
+        stem = Path(path).stem
+        if stem == "__init__" and Path(path).parent != Path("."):
+            mod_title = Path(path).parent.name.replace("_", " ").title() + " (init)"
+        else:
+            mod_title = stem.replace("_", " ").replace("-", " ").title()
+
         guide.modules[path] = ModuleNarrative(
             path=path,
-            title=Path(path).stem.replace("_", " ").replace("-", " ").title(),
+            title=mod_title,
             summary=_section(raw, "What this module does") or raw[:300],
             walkthrough=_section(raw, "How it fits into the system"),
             design_notes=_section(raw, "Key design decisions"),

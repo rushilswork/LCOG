@@ -52,8 +52,8 @@ def main():
 
 @main.command()
 @click.argument("repo_path", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--output", "-o", default="onboarding-guide", show_default=True,
-              type=click.Path(path_type=Path), help="Output directory for the MkDocs site")
+@click.option("--output", "-o", default=None,
+              type=click.Path(path_type=Path), help="Output directory [default: <repo>/onboarding-guide]")
 @click.option("--provider", default="groq", show_default=True,
               type=click.Choice(["groq", "gemini"], case_sensitive=False),
               help="LLM provider to use")
@@ -100,7 +100,7 @@ def analyze(
         sys.exit(1)
 
     site_name = site_name or f"{repo_path.name} Onboarding"
-    output = output.resolve()
+    output = (output or repo_path / "onboarding-guide").resolve()
 
     # -----------------------------------------------------------------------
     # Stage 1: Static analysis
@@ -171,7 +171,14 @@ def analyze(
         from onboard.stages.narrative_gen import OnboardingGuide, ModuleNarrative
         import networkx as nx
 
-        reading_order = list(nx.topological_sort(graph))
+        try:
+            reading_order = list(nx.topological_sort(graph))
+        except nx.NetworkXUnfeasible:
+            cond = nx.condensation(graph)
+            topo_sccs = list(nx.topological_sort(cond))
+            reading_order = []
+            for scc_node in topo_sccs:
+                reading_order.extend(list(cond.nodes[scc_node]["members"]))
         guide = OnboardingGuide(
             system_overview=f"# {site_name}\n\nStub overview -- run without --skip-llm for full narrative.",
             reading_order=reading_order,
@@ -180,9 +187,15 @@ def analyze(
         for path in reading_order[:max_modules]:
             node_data = graph.nodes.get(path, {})
             lang = node_data.get("language", "?")
+            stem = Path(path).stem
+            if stem == "__init__" and Path(path).parent != Path("."):
+                mod_title = Path(path).parent.name.replace("_", " ").title() + " (init)"
+            else:
+                mod_title = stem.replace("_", " ").title()
+
             guide.modules[path] = ModuleNarrative(
                 path=path,
-                title=Path(path).stem.replace("_", " ").title(),
+                title=mod_title,
                 summary=f"*Stub -- {lang} module at `{path}`.*",
                 walkthrough="",
                 design_notes="",
