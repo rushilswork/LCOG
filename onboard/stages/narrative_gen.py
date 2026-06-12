@@ -19,8 +19,10 @@ Also produces:
 
 from __future__ import annotations
 
+import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -40,6 +42,9 @@ PROVIDER_DEFAULTS: dict[str, dict] = {
     "groq":   {"model": "llama-3.3-70b-versatile", "max_tokens": 1500},
     "gemini": {"model": "gemini-1.5-flash",         "max_tokens": 1500},
 }
+
+# Max concurrent LLM requests (tune down if hitting rate limits)
+_LLM_MAX_CONCURRENT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +127,7 @@ def _imports_summary(imports: list[str], max_items: int = 15) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Section extraction (defined once, not inside the generation loop)
+# Section extraction
 # ---------------------------------------------------------------------------
 
 def _extract_section(text: str, heading: str) -> str:
@@ -137,7 +142,22 @@ def _extract_section(text: str, heading: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Provider-agnostic LLM call with retry
+# Format-string injection guard
+# ---------------------------------------------------------------------------
+
+def _esc(s: str) -> str:
+    """Escape curly braces in user content so str.format() does not crash.
+
+    Docstrings, commit messages, and symbol names regularly contain curly
+    braces: Python dicts ("returns {key: val}"), TypeScript generics
+    ("{T extends object}"), commit messages ("add {env} support"), etc.
+    Without escaping these, MODULE_PROMPT.format(...) raises KeyError.
+    """
+    return s.replace("{", "{{").replace("}", "}}")
+
+
+# ---------------------------------------------------------------------------
+# Provider-agnostic LLM call with retry + jitter
 # ---------------------------------------------------------------------------
 
 _RATE_LIMIT_SIGNALS = ("rate_limit", "429", "too many", "quota", "resource_exhausted")
@@ -149,7 +169,8 @@ def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: 
     """Call the specified LLM provider and return the response text.
 
     Retries up to _MAX_RETRIES times on rate-limit / transient errors with
-    exponential backoff.  Raises on non-retriable errors or exhausted retries.
+    exponential backoff + jitter to prevent thundering herd under concurrency.
+    Raises on non-retriable errors or exhausted retries.
     """
     last_exc: Optional[Exception] = None
 
@@ -161,7 +182,9 @@ def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: 
             err_lower = str(exc).lower()
             is_retriable = any(sig in err_lower for sig in _RATE_LIMIT_SIGNALS)
             if is_retriable and attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                # Exponential backoff + random jitter so concurrent threads
+                # don't all retry at the same instant (thundering herd)
+                wait = _RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
                 time.sleep(wait)
                 continue
             raise
@@ -291,6 +314,89 @@ def _reading_order(graph: nx.DiGraph, history: RepoHistory, entry_points: list[s
 
 
 # ---------------------------------------------------------------------------
+# Per-module generation helper (thread-safe, no shared mutable state)
+# ---------------------------------------------------------------------------
+
+def _generate_module(
+    path: str,
+    graph: nx.DiGraph,
+    history: RepoHistory,
+    corpus: DocCorpus,
+    provider: str,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+) -> tuple[str, ModuleNarrative, Optional[str]]:
+    """Generate narrative for one module. Designed to run inside a thread pool.
+
+    Returns (path, ModuleNarrative, err_logged). Never raises — errors are
+    captured as a stub narrative so the rest of the guide can still be built.
+    """
+    node_data = graph.nodes.get(path, {})
+    lang = node_data.get("language", "unknown")
+    symbols: list[Symbol] = node_data.get("symbols", [])
+    imports: list[str] = node_data.get("imports", [])
+    fh = history.files.get(path)
+    dependants = list(graph.predecessors(path))
+    dependencies = list(graph.successors(path))
+
+    # _esc() is CRITICAL: docstrings, commit messages, and symbol names
+    # regularly contain { } (dicts, generics, format strings, etc.) which
+    # would cause KeyError/IndexError in str.format() without escaping.
+    prompt = MODULE_PROMPT.format(
+        path=_esc(path),
+        language=_esc(lang),
+        symbols=_esc(_symbol_summary(symbols)),
+        imports=_esc(_imports_summary(imports)),
+        history=_esc(_history_summary(fh)),
+        docs=_esc(_doc_fragments_text(path, corpus)),
+        dependants=_esc(", ".join(dependants[:10]) or "none"),
+        dependencies=_esc(", ".join(dependencies[:10]) or "none"),
+    )
+
+    try:
+        raw = _call_llm(prompt, provider, api_key, model, max_tokens)
+        err_logged = None
+    except Exception as e:
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        raw = f"*Narrative generation failed: {err_msg}*"
+        err_logged = err_msg
+
+    dead_warn = None
+    if fh and fh.is_dead_code_candidate:
+        dead_warn = (
+            f"**Potential dead code**: not modified in {fh.last_modified_days:.0f} days. "
+            "Verify it is still in use before editing."
+        )
+
+    hotspot_warn = None
+    if fh and fh.change_frequency > 50:
+        hotspot_warn = (
+            f"**Hotspot**: changed {fh.change_frequency} times -- high churn. "
+            "Add tests before modifying."
+        )
+
+    stem = Path(path).stem
+    if stem == "__init__" and Path(path).parent != Path("."):
+        mod_title = Path(path).parent.name.replace("_", " ").title() + " (init)"
+    else:
+        mod_title = stem.replace("_", " ").replace("-", " ").title()
+
+    narrative = ModuleNarrative(
+        path=path,
+        title=mod_title,
+        summary=_extract_section(raw, "What this module does") or raw[:300],
+        walkthrough=_extract_section(raw, "How it fits into the system"),
+        design_notes=_extract_section(raw, "Key design decisions"),
+        pitfalls=_extract_section(raw, "Pitfalls to avoid"),
+        dead_code_warning=dead_warn,
+        hotspot_warning=hotspot_warn,
+        reading_order_index=0,  # set by caller after collection
+    )
+    return path, narrative, err_logged
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -327,56 +433,124 @@ def generate_guide(
     modules_to_process = reading_order[:max_modules]
 
     log(f"Provider: {provider} | Model: {model}")
-    log(f"Generating narratives for {len(modules_to_process)} modules...")
+    log(f"Generating narratives for {len(modules_to_process)} modules "
+        f"({_LLM_MAX_CONCURRENT} concurrent)...")
 
+    # ---- Concurrent module narrative generation ----------------------------
+    # Each _generate_module call is independent (read-only graph/history/corpus).
+    # A bounded thread pool caps concurrent API requests to avoid rate limits.
+    # Results are collected in arrival order and re-sorted to reading order.
+
+    raw_results: dict[str, ModuleNarrative] = {}
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=_LLM_MAX_CONCURRENT) as executor:
+        future_map = {
+            executor.submit(
+                _generate_module,
+                path, graph, history, corpus,
+                provider, api_key, model, max_tokens,
+            ): path
+            for path in modules_to_process
+        }
+        for future in as_completed(future_map):
+            path, narrative, err_logged = future.result()
+            done_count += 1
+            log(f"  [{done_count}/{len(modules_to_process)}] {path}")
+            if err_logged:
+                log(f"    [warning] {err_logged}")
+            raw_results[path] = narrative
+
+    # Restore reading order and assign index
     for idx, path in enumerate(modules_to_process):
-        node_data = graph.nodes.get(path, {})
-        lang = node_data.get("language", "unknown")
-        symbols: list[Symbol] = node_data.get("symbols", [])
-        imports: list[str] = node_data.get("imports", [])
-        fh = history.files.get(path)
-        dependants = list(graph.predecessors(path))
-        dependencies = list(graph.successors(path))
+        if path in raw_results:
+            raw_results[path].reading_order_index = idx
+            guide.modules[path] = raw_results[path]
 
-        prompt = MODULE_PROMPT.format(
-            path=path,
-            language=lang,
-            symbols=_symbol_summary(symbols),
-            imports=_imports_summary(imports),
-            history=_history_summary(fh),
-            docs=_doc_fragments_text(path, corpus),
-            dependants=", ".join(dependants[:10]) or "none",
-            dependencies=", ".join(dependencies[:10]) or "none",
+    # ---- System overview ---------------------------------------------------
+    log("Generating system overview...")
+
+    from onboard.stages.static_analysis import summarize_graph
+    summary = summarize_graph(graph)
+
+    hotspot_lines = []
+    sorted_files = sorted(
+        history.files.values(),
+        key=lambda fh: fh.change_frequency,
+        reverse=True,
+    )
+    for fh in sorted_files[:10]:
+        hotspot_lines.append(f"  {fh.path}  ({fh.change_frequency} commits)")
+
+    arch_docs = corpus.arch_docs()
+    arch_text = "\n".join(f.content[:300] for f in arch_docs[:3]) or "None found."
+
+    # _esc() applied to all user content — arch docs and commit themes can
+    # contain { } characters that would crash OVERVIEW_PROMPT.format().
+    overview_prompt = OVERVIEW_PROMPT.format(
+        total_files=summary["total_files"],
+        languages=_esc(str(summary["languages"])),
+        entry_points=_esc(", ".join(summary["entry_points"][:10]) or "none detected"),
+        hotspots=_esc("\n".join(hotspot_lines) or "  (no git history)"),
+        themes=_esc(", ".join(history.major_themes[:10]) or "none detected"),
+        arch_docs=_esc(arch_text),
+        reading_order=_esc("\n".join(f"  {p}" for p in modules_to_process[:20])),
+    )
+
+    try:
+        guide.system_overview = _call_llm(
+            overview_prompt, provider, api_key, model, max_tokens
         )
+    except Exception as e:
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        guide.system_overview = f"*Overview generation failed: {err_msg}*"
+        log(f"  [warning] overview: {err_msg}")
 
-        log(f"  [{idx + 1}/{len(modules_to_process)}] {path}")
+    # ---- Guided tour -------------------------------------------------------
+    guide.guided_tour = _build_guided_tour(guide, graph, history)
 
-        try:
-            raw = _call_llm(prompt, provider, api_key, model, max_tokens)
-        except Exception as e:
-            # Sanitize the error — strip the API key if it appears in the message
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            raw = f"*Narrative generation failed: {err_msg}*"
-            log(f"    [warning] {err_msg}")
+    return guide
 
-        dead_warn = None
-        if fh and fh.is_dead_code_candidate:
-            dead_warn = (
-                f"**Potential dead code**: not modified in {fh.last_modified_days:.0f} days. "
-                "Verify it is still in use before editing."
-            )
 
-        hotspot_warn = None
-        if fh and fh.change_frequency > 50:
-            hotspot_warn = (
-                f"**Hotspot**: changed {fh.change_frequency} times -- high churn. "
-                "Add tests before modifying."
-            )
+# ---------------------------------------------------------------------------
+# Guided tour builder
+# ---------------------------------------------------------------------------
 
-        stem = Path(path).stem
-        if stem == "__init__" and Path(path).parent != Path("."):
-            mod_title = Path(path).parent.name.replace("_", " ").title() + " (init)"
-        else:
-            mod_title = stem.replace("_", " ").replace("-", " ").title()
+def _build_guided_tour(
+    guide: OnboardingGuide,
+    graph: nx.DiGraph,
+    history: RepoHistory,
+) -> str:
+    """Build a markdown guided tour from the generated narratives."""
+    lines = ["# Guided Tour\n"]
+    lines.append(
+        "This tour walks you through the codebase in the recommended reading order. "
+        "Follow the links to dive deeper into each module.\n"
+    )
 
-        guide.modules[path] = ModuleNarrativ
+    for idx, path in enumerate(guide.reading_order):
+        mod = guide.modules.get(path)
+        if mod is None:
+            continue
+
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", path)
+        lines.append(f"## Step {idx + 1}: [{mod.title}](modules/{slug}.md)\n")
+
+        if mod.summary:
+            # First paragraph of summary only
+            first_para = mod.summary.split("\n\n")[0].strip()
+            lines.append(first_para + "\n")
+
+        fh = history.files.get(path)
+        if fh:
+            if fh.is_dead_code_candidate:
+                lines.append(
+                    f"> Potential dead code: not modified in "
+                    f"{fh.last_modified_days:.0f} days.\n"
+                )
+            elif fh.change_frequency > 50:
+                lines.append(
+                    f"> Hotspot: changed {fh.change_frequency} times.\n"
+                )
+
+    return "\n".join(lines)

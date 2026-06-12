@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -75,7 +76,6 @@ _PROSE_EXTS = {".md", ".rst"}   # .txt excluded — too many false positives
 def _collect_prose_docs(repo_path: Path, corpus: DocCorpus) -> None:
     """Walk repo, collecting README / architecture / changelog prose."""
     for dirpath, dirnames, filenames in os.walk(repo_path):
-        # Prune ignored dirs in-place so os.walk won't descend into them
         dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
 
         for filename in filenames:
@@ -108,7 +108,7 @@ def _collect_prose_docs(repo_path: Path, corpus: DocCorpus) -> None:
             corpus.fragments.append(DocFragment(
                 source_file=rel,
                 kind=kind,
-                content=content[:4000],   # cap at 4 KB
+                content=content[:4000],
             ))
 
 
@@ -117,8 +117,8 @@ def _collect_prose_docs(repo_path: Path, corpus: DocCorpus) -> None:
 # ---------------------------------------------------------------------------
 
 _PY_DOCSTRING_RE = re.compile(
-    r'(?:^[ \t]*(?:class|def)\s+(\w+)[^:]*:\s*\n)'   # def/class line → group 1: name
-    r'[ \t]*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')',         # triple-quoted docstring
+    r'(?:^[ \t]*(?:class|def)\s+(\w+)[^:]*:\s*\n)'
+    r'[ \t]*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\')',
     re.DOTALL | re.MULTILINE,
 )
 
@@ -152,7 +152,6 @@ def _collect_jsdoc(rel_path: str, source: str, corpus: DocCorpus) -> None:
         doc = m.group(1).strip()
         if not doc:
             continue
-        # Try to find the function name immediately after
         after = source[m.end():m.end() + 200]
         fn_m = _JSDOC_FUNC_RE.search(after)
         symbol = (fn_m.group(1) or fn_m.group(2)) if fn_m else None
@@ -206,40 +205,55 @@ SOURCE_EXTS = {".py", ".js", ".mjs", ".ts", ".tsx", ".cpp", ".cc", ".cxx",
                ".c", ".h", ".hpp", ".java"}
 
 
+def _process_source_file(abs_path: Path, rel: str) -> list[DocFragment]:
+    """Extract doc fragments from one source file. Thread-safe (no shared state)."""
+    try:
+        if abs_path.stat().st_size / 1024 > 300:
+            return []
+        source = abs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    local = DocCorpus()
+    ext = abs_path.suffix.lower()
+    if ext == ".py":
+        _collect_python_docstrings(rel, source, local)
+    elif ext in (".js", ".mjs", ".ts", ".tsx"):
+        _collect_jsdoc(rel, source, local)
+    elif ext in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".java"):
+        _collect_doxygen(rel, source, local)
+    return local.fragments
+
+
 def collect_docs(repo_path: Path) -> DocCorpus:
     """Walk *repo_path* and collect all documentation fragments."""
     corpus = DocCorpus()
 
-    # Prose / README files
+    # Prose / README files — sequential (few, large files)
     _collect_prose_docs(repo_path, corpus)
 
-    # Source-file inline docs — use os.walk so we can prune dirs
+    # Source-file inline docs — collect candidates, then process in parallel
+    candidates: list[tuple[Path, str]] = []
     for dirpath, dirnames, filenames in os.walk(repo_path):
         dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
 
         for filename in filenames:
             if Path(filename).suffix.lower() not in SOURCE_EXTS:
                 continue
-
             abs_path = Path(dirpath) / filename
-            try:
-                if abs_path.stat().st_size / 1024 > 300:
-                    continue
-                source = abs_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-
             try:
                 rel = abs_path.relative_to(repo_path).as_posix()
             except ValueError:
                 continue
+            candidates.append((abs_path, rel))
 
-            ext = abs_path.suffix.lower()
-            if ext == ".py":
-                _collect_python_docstrings(rel, source, corpus)
-            elif ext in (".js", ".mjs", ".ts", ".tsx"):
-                _collect_jsdoc(rel, source, corpus)
-            elif ext in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".java"):
-                _collect_doxygen(rel, source, corpus)
+    num_workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(_process_source_file, abs_path, rel)
+            for abs_path, rel in candidates
+        ]
+        for future in futures:
+            corpus.fragments.extend(future.result())
 
     return corpus

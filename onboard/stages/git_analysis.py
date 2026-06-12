@@ -1,24 +1,26 @@
 """Stage 2: Historical context extraction from git history.
 
+Uses a single `git log --name-only` subprocess call instead of per-commit
+diffs, which is 10–100x faster on large repositories.
+
 Produces per-file metrics:
 - change_frequency: how often the file changes (hotspot score)
 - co_changes: dict of {other_file: co-change count} (logical coupling)
 - last_modified_days: days since last commit touching this file
 - top_authors: list of (author, commit_count)
 - commit_messages: sample of commit messages touching this file
-- is_dead_code_candidate: True if not touched in >2 years and no dependants
+- is_dead_code_candidate: True if not touched in >2 years
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
-from git import GitCommandError, GitCommandNotFound, InvalidGitRepositoryError, Repo
 
 
 # ---------------------------------------------------------------------------
@@ -45,11 +47,80 @@ class RepoHistory:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Git log via subprocess  (much faster than gitpython diff-per-commit)
 # ---------------------------------------------------------------------------
 
 DEAD_CODE_THRESHOLD_DAYS = 730   # ~2 years
 
+
+def _run_git_log(repo_path: Path, max_commits: int) -> Optional[str]:
+    """Run one `git log --name-only` command and return raw stdout.
+
+    Uses null-byte (\\x00) as the commit record separator so the output is
+    easy to split without worrying about newlines in commit subjects.
+
+    Returns None on any failure (git not found, not a repo, timeout, etc.).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "log",
+                "--name-only",   # list changed files below each commit header
+                "--no-renames",  # treat renames as delete+add; simpler to parse
+                f"--max-count={max_commits}",
+                "--format=%x00%H%x01%aN%x01%s%x01%ct",  # null-delimited header
+                "HEAD",
+            ],
+            capture_output=True,
+            cwd=str(repo_path),
+            timeout=120,
+        )
+    except FileNotFoundError:
+        return None   # git not installed
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None   # not a git repo, or no HEAD yet
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _parse_git_log(log_text: str) -> list[dict]:
+    """Parse the output of _run_git_log into a list of commit dicts.
+
+    Each dict has keys: hexsha, author, subject, ts (float), files (set[str]).
+    """
+    commits: list[dict] = []
+    for block in log_text.split("\x00"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        lines = block.splitlines()
+        if not lines:
+            continue
+        # First line is the format header; remaining non-blank lines are files
+        header = lines[0]
+        parts = header.split("\x01", 3)
+        if len(parts) < 4:
+            continue
+        hexsha, author, subject, ts_str = parts[0], parts[1], parts[2], parts[3]
+        try:
+            ts = float(ts_str.strip())
+        except (ValueError, AttributeError):
+            ts = 0.0
+        changed_files = {ln.strip() for ln in lines[1:] if ln.strip()}
+        commits.append({
+            "hexsha":  hexsha.strip(),
+            "author":  author.strip() or "unknown",
+            "subject": subject.strip(),
+            "ts":      ts,
+            "files":   changed_files,
+        })
+    return commits
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
     """Analyse the git history of *repo_path* and return a RepoHistory.
@@ -57,72 +128,46 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
     Returns an empty RepoHistory if the directory is not a git repo, has no
     commits, or git is not installed -- so the pipeline degrades gracefully.
     """
-    try:
-        repo = Repo(repo_path, search_parent_directories=True)
-    except InvalidGitRepositoryError:
-        return RepoHistory()
-    except Exception:
+    log_text = _run_git_log(repo_path, max_commits)
+    if not log_text:
         return RepoHistory()
 
-    # Bare repos have no working tree -- skip gracefully
-    if repo.bare:
+    commits = _parse_git_log(log_text)
+    if not commits:
         return RepoHistory()
 
-    history = RepoHistory()
-    now = datetime.now(tz=timezone.utc)
+    history = RepoHistory(total_commits=len(commits))
+    now_ts = datetime.now(tz=timezone.utc).timestamp()
 
-    commit_files: dict[str, set[str]] = {}
     author_counter: Counter = Counter()
     all_messages: list[str] = []
 
-    file_commits: dict[str, list] = defaultdict(list)
+    # Per-file accumulators
+    file_freq: dict[str, int] = defaultdict(int)
     file_authors: dict[str, Counter] = defaultdict(Counter)
     file_messages: dict[str, list[str]] = defaultdict(list)
     file_last_ts: dict[str, float] = {}
-
-    try:
-        commits = list(repo.iter_commits("HEAD", max_count=max_commits))
-    except (GitCommandError, GitCommandNotFound, ValueError):
-        # Empty repo, no HEAD, or git binary missing
-        return RepoHistory()
-
-    history.total_commits = len(commits)
+    commit_files: dict[str, set[str]] = {}  # hexsha → set of touched paths
 
     for commit in commits:
-        author = (commit.author.name or "unknown") if commit.author else "unknown"
+        author  = commit["author"]
+        subject = commit["subject"]
+        ts      = commit["ts"]
+        hexsha  = commit["hexsha"]
+        touched = commit["files"]
+
         author_counter[author] += 1
-        msg = (commit.message or "").strip().split("\n")[0]
-        all_messages.append(msg)
-
-        touched: set[str] = set()
-        try:
-            if commit.parents:
-                diff = commit.parents[0].diff(commit)
-            else:
-                diff = commit.diff(None)
-            for d in diff:
-                fpath = d.b_path or d.a_path
-                # gitpython always returns forward-slash paths
-                if fpath:
-                    touched.add(fpath)
-        except Exception:
-            pass
-
-        commit_files[commit.hexsha] = touched
-
-        try:
-            ts = commit.committed_datetime.timestamp()
-        except Exception:
-            ts = 0.0
+        all_messages.append(subject)
+        commit_files[hexsha] = touched
 
         for fpath in touched:
-            file_commits[fpath].append(commit)
+            file_freq[fpath] += 1
             file_authors[fpath][author] += 1
-            file_messages[fpath].append(msg)
+            file_messages[fpath].append(subject)
             if fpath not in file_last_ts or ts > file_last_ts[fpath]:
                 file_last_ts[fpath] = ts
 
-    # Build co-change matrix
+    # Co-change matrix (files that change together)
     co_change: dict[str, Counter] = defaultdict(Counter)
     for touched in commit_files.values():
         file_list = list(touched)
@@ -131,29 +176,22 @@ def analyze_git(repo_path: Path, max_commits: int = 2000) -> RepoHistory:
                 co_change[fa][fb] += 1
                 co_change[fb][fa] += 1
 
-    for fpath, commits_list in file_commits.items():
+    for fpath, freq in file_freq.items():
         last_ts = file_last_ts.get(fpath)
-        if last_ts:
-            last_modified_days = (now.timestamp() - last_ts) / 86400
-        else:
-            last_modified_days = None
+        last_modified_days = (now_ts - last_ts) / 86400 if last_ts else None
 
-        top_authors = file_authors[fpath].most_common(3)
-        msgs = file_messages[fpath][:10]
-
-        fh = FileHistory(
+        history.files[fpath] = FileHistory(
             path=fpath,
-            change_frequency=len(commits_list),
+            change_frequency=freq,
             co_changes=dict(co_change[fpath].most_common(10)),
             last_modified_days=last_modified_days,
-            top_authors=top_authors,
-            commit_messages=msgs,
+            top_authors=file_authors[fpath].most_common(3),
+            commit_messages=file_messages[fpath][:10],
             is_dead_code_candidate=(
                 last_modified_days is not None
                 and last_modified_days > DEAD_CODE_THRESHOLD_DAYS
             ),
         )
-        history.files[fpath] = fh
 
     history.active_authors = [a for a, _ in author_counter.most_common(10)]
     history.major_themes = _cluster_messages(all_messages)

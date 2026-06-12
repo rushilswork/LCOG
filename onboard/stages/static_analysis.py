@@ -1,6 +1,7 @@
 """Stage 1: Static structure mapping via tree-sitter."""
 from __future__ import annotations
-import itertools, os
+import itertools, os, threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -9,7 +10,8 @@ import networkx as nx
 LANGUAGE_EXTENSIONS: dict[str, list[str]] = {
     "python":     [".py"],
     "javascript": [".js", ".mjs", ".cjs"],
-    "typescript": [".ts", ".tsx"],
+    "typescript": [".ts"],
+    "tsx":        [".tsx"],   # TSX requires a separate grammar (language_tsx())
     "cpp":        [".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh"],
     "java":       [".java"],
 }
@@ -26,6 +28,9 @@ def _get_lang_module(language: str):
             import tree_sitter_javascript; return tree_sitter_javascript.language()
         elif language == "typescript":
             import tree_sitter_typescript; return tree_sitter_typescript.language_typescript()
+        elif language == "tsx":
+            # TSX has JSX-specific syntax — must use the tsx variant, not typescript
+            import tree_sitter_typescript; return tree_sitter_typescript.language_tsx()
         elif language == "cpp":
             import tree_sitter_cpp; return tree_sitter_cpp.language()
         elif language == "java":
@@ -37,15 +42,20 @@ def _get_lang_module(language: str):
         ) from e
     raise ValueError(f"Unsupported language: {language}")
 
-_parser_cache: dict[str, object] = {}
+# Thread-local parser cache — tree-sitter Parser is NOT thread-safe across
+# threads, so each thread keeps its own set of parsers.
+_thread_local = threading.local()
 
 def _load_parser(language: str):
-    if language in _parser_cache:
-        return _parser_cache[language]
+    if not hasattr(_thread_local, "parsers"):
+        _thread_local.parsers = {}
+    cache: dict = _thread_local.parsers
+    if language in cache:
+        return cache[language]
     from tree_sitter import Language, Parser
     lang_obj = Language(_get_lang_module(language))
     parser = Parser(lang_obj)
-    _parser_cache[language] = parser
+    cache[language] = parser
     return parser
 
 @dataclass
@@ -62,12 +72,13 @@ class FileNode:
     symbols: list[Symbol] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     is_entry_point: bool = False
-    raw_source: str = ""
+    # raw_source removed — was stored but never read after parsing (memory waste)
 
 IMPORT_NODE_TYPES: dict[str, set[str]] = {
     "python":     {"import_statement", "import_from_statement"},
     "javascript": {"import_declaration", "require_call"},
     "typescript": {"import_declaration", "require_call"},
+    "tsx":        {"import_declaration", "require_call"},
     "cpp":        {"preproc_include"},
     "java":       {"import_declaration"},
 }
@@ -75,6 +86,7 @@ FUNCTION_NODE_TYPES: dict[str, set[str]] = {
     "python":     {"function_definition"},
     "javascript": {"function_declaration", "arrow_function", "method_definition"},
     "typescript": {"function_declaration", "arrow_function", "method_definition"},
+    "tsx":        {"function_declaration", "arrow_function", "method_definition"},
     "cpp":        {"function_definition"},
     "java":       {"method_declaration"},
 }
@@ -82,6 +94,7 @@ CLASS_NODE_TYPES: dict[str, set[str]] = {
     "python":     {"class_definition"},
     "javascript": {"class_declaration"},
     "typescript": {"class_declaration", "interface_declaration"},
+    "tsx":        {"class_declaration", "interface_declaration"},
     "cpp":        {"class_specifier", "struct_specifier"},
     "java":       {"class_declaration", "interface_declaration"},
 }
@@ -141,6 +154,7 @@ ENTRY_PATTERNS = {
     "python":     ['__name__ == "__main__"', "def main(", "app.run(", "uvicorn.run(", "asyncio.run("],
     "javascript": ["app.listen(", "server.listen(", "createServer(", "express()"],
     "typescript": ["app.listen(", "server.listen(", "bootstrap("],
+    "tsx":        ["ReactDOM.render(", "createRoot(", "hydrateRoot("],
     "cpp":        ["int main(", "void main("],
     "java":       ["public static void main("],
 }
@@ -148,14 +162,43 @@ ENTRY_PATTERNS = {
 def _is_entry_point(source: str, language: str) -> bool:
     return any(p in source for p in ENTRY_PATTERNS.get(language, []))
 
-def analyze_repo(repo_path: Path, max_file_kb: int = 500) -> nx.DiGraph:
-    """Walk *repo_path* and build a directed module dependency graph."""
+def _process_file(
+    abs_path: Path, rel_path: Path, language: str, max_file_kb: int
+) -> Optional[tuple]:
+    """Parse one source file. Thread-safe — uses thread-local parser cache.
+
+    Returns (key, language, symbols, imports, is_entry, rel_path) or None if
+    the file should be skipped (too large, unreadable, parse error).
+    """
+    try:
+        if abs_path.stat().st_size / 1024 > max_file_kb:
+            return None
+        source_bytes = abs_path.read_bytes()
+        source_str = source_bytes.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    symbols, imports = _extract_symbols(source_bytes, language)
+    is_entry = _is_entry_point(source_str, language)
+    return rel_path.as_posix(), language, symbols, imports, is_entry, rel_path
+
+def analyze_repo(repo_path: Path, max_file_kb: int = 500, workers: int = 0) -> nx.DiGraph:
+    """Walk *repo_path* and build a directed module dependency graph.
+
+    Parameters
+    ----------
+    workers:
+        Number of parallel worker threads for file parsing.
+        0 (default) = auto (min(8, cpu_count)).
+    """
     graph: nx.DiGraph = nx.DiGraph()
     file_nodes: dict[str, FileNode] = {}
     ignore_dirs = {
         ".git", ".svn", "__pycache__", "node_modules", ".venv", "venv",
         "env", "dist", "build", ".next", "target", ".gradle", "onboarding-guide",
     }
+
+    # ── Pass 1: collect candidate files (pure filesystem walk, no I/O) ──────
+    candidates: list[tuple[Path, Path, str]] = []
     for dirpath, dirnames, filenames in os.walk(repo_path):
         dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
         for filename in filenames:
@@ -168,27 +211,42 @@ def analyze_repo(repo_path: Path, max_file_kb: int = 500) -> nx.DiGraph:
                 rel_path = abs_path.relative_to(repo_path)
             except ValueError:
                 continue
+            candidates.append((abs_path, rel_path, language))
+
+    # ── Pass 2: parse files in parallel ──────────────────────────────────────
+    # tree-sitter is a C extension — releases the GIL during parse so threads
+    # run in genuine parallel on multi-core machines.
+    num_workers = workers if workers > 0 else min(8, os.cpu_count() or 4)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_list = [
+            executor.submit(_process_file, abs_path, rel_path, language, max_file_kb)
+            for abs_path, rel_path, language in candidates
+        ]
+        for future in future_list:
             try:
-                if abs_path.stat().st_size / 1024 > max_file_kb:
-                    continue
-                source_bytes = abs_path.read_bytes()
-                source_str = source_bytes.decode("utf-8", errors="replace")
-            except OSError:
+                result = future.result()
+            except Exception:
+                # Skip files that raise unexpected exceptions (MemoryError, etc.)
                 continue
-            symbols, imports = _extract_symbols(source_bytes, language)
-            is_entry = _is_entry_point(source_str, language)
-            node = FileNode(path=rel_path, language=language, symbols=symbols,
-                imports=imports, is_entry_point=is_entry, raw_source=source_str)
-            key = rel_path.as_posix()  # always forward slashes — matches gitpython
-            file_nodes[key] = node
-            graph.add_node(key, language=language, symbols=symbols, imports=imports,
+            if result is None:
+                continue
+            key, lang, symbols, imports, is_entry, rel_path = result
+            file_nodes[key] = FileNode(
+                path=rel_path, language=lang,
+                symbols=symbols, imports=imports, is_entry_point=is_entry,
+            )
+            graph.add_node(key, language=lang, symbols=symbols, imports=imports,
                 is_entry_point=is_entry, label=rel_path.stem)
+
+    # ── Pass 3: build dependency edges (sequential — pure in-memory) ─────────
     path_index = _build_path_index(file_nodes)
     for src_key, node in file_nodes.items():
         for imp in node.imports:
             resolved = _resolve_import(imp, node, path_index)
             if resolved and resolved != src_key:
                 graph.add_edge(src_key, resolved, label="imports")
+
     return graph
 
 def _build_path_index(nodes: dict[str, FileNode]) -> dict[str, str]:
@@ -215,7 +273,7 @@ def _resolve_import(imp_text: str, node: FileNode, index: dict[str, str]) -> Opt
                 candidates.extend(tok.split("."))
             else:
                 candidates.append(tok)
-    elif node.language in ("javascript", "typescript"):
+    elif node.language in ("javascript", "typescript", "tsx"):
         for tok in tokens:
             if tok.startswith("."):
                 candidates.append(Path(tok).stem)

@@ -35,6 +35,8 @@ def _mermaid_graph(graph: nx.DiGraph, max_nodes: int = 30) -> str:
         sub = graph
     for node, data in sub.nodes(data=True):
         label = data.get("label", Path(node).stem)
+        # Escape quotes in label to prevent Mermaid syntax errors
+        label = label.replace('"', "'")
         is_entry = data.get("is_entry_point", False)
         slug = _slugify(node)
         if is_entry:
@@ -46,7 +48,9 @@ def _mermaid_graph(graph: nx.DiGraph, max_nodes: int = 30) -> str:
     lines.append("    classDef entry fill:#f9a,stroke:#c55,stroke-width:2px;")
     for node in sub.nodes():
         slug = _slugify(node)
-        lines.append(f'    click {slug} "modules/{slug}.md"')
+        # Use directory URL (modules/slug/) — MkDocs serves .md at the directory
+        # URL and does NOT redirect .md requests in a built (non-serve) site.
+        lines.append(f'    click {slug} "modules/{slug}/"')
     lines.append("```")
     return "\n".join(lines)
 
@@ -337,7 +341,7 @@ def _build_interactive_graph(graph: nx.DiGraph) -> str:
 
 
 def _build_mkdocs_yml(site_name: str, module_paths: list) -> str:
-    """Build mkdocs.yml content.  output_dir removed — unused."""
+    """Build mkdocs.yml content."""
     def _nav_title(p: str) -> str:
         stem = Path(p).stem
         if stem == "__init__" and Path(p).parent != Path("."):
@@ -437,6 +441,3 @@ def build_site(guide: OnboardingGuide, graph: nx.DiGraph,
 
     yml = _build_mkdocs_yml(site_name, list(guide.modules.keys()))
     (output_dir / "mkdocs.yml").write_text(yml, encoding="utf-8")
-
-    print(f"MkDocs site written to {output_dir}")
-    print(f"   Run: cd {output_dir} && mkdocs serve")

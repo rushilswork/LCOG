@@ -4,7 +4,7 @@ Usage:
     onboard analyze <repo_path> [OPTIONS]
 
 Options:
-    --output DIR         Output directory for the MkDocs site  [default: ./onboarding-guide]
+    --output DIR         Output directory for the MkDocs site  [default: <repo>/onboarding-guide]
     --provider TEXT      LLM provider: groq or gemini          [default: groq]
     --api-key TEXT       API key (or set GROQ_API_KEY / GEMINI_API_KEY env vars)
     --model TEXT         Override the default model for the chosen provider
@@ -12,6 +12,7 @@ Options:
     --max-modules INT    Cap on modules sent to the LLM        [default: 50]
     --skip-llm           Generate stub narratives without calling any LLM
     --serve              Run `mkdocs serve` after generation
+    --workers INT        Parallel workers for file parsing (0=auto)
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
@@ -69,6 +71,8 @@ def main():
               help="Skip LLM stage; produce stub narratives only")
 @click.option("--serve", is_flag=True, default=False,
               help="Run `mkdocs serve` after generation")
+@click.option("--workers", default=0, show_default=True, type=int,
+              help="Parallel workers for file parsing (0=auto, uses CPU count)")
 def analyze(
     repo_path: Path,
     output: Path,
@@ -79,6 +83,7 @@ def analyze(
     max_modules: int,
     skip_llm: bool,
     serve: bool,
+    workers: int,
 ):
     """Analyse REPO_PATH and generate an onboarding guide."""
     _banner()
@@ -103,59 +108,52 @@ def analyze(
     output = (output or repo_path / "onboarding-guide").resolve()
 
     # -----------------------------------------------------------------------
-    # Stage 1: Static analysis
+    # Stages 1–3: run in parallel (all are independent of each other)
     # -----------------------------------------------------------------------
-    _step("Stage 1 -- Static structure mapping")
-    from onboard.stages.static_analysis import analyze_repo, summarize_graph
+    _step("Stages 1-3 -- Analysis (parallel)")
 
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeElapsedColumn(),
-                  console=console) as prog:
-        t = prog.add_task("Parsing source files...", total=None)
-        graph = analyze_repo(repo_path)
-        prog.update(t, completed=True)
+    from onboard.stages.static_analysis import analyze_repo, summarize_graph
+    from onboard.stages.git_analysis import analyze_git
+    from onboard.stages.doc_collector import collect_docs
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as prog:
+        t1 = prog.add_task("[cyan]Static analysis[/cyan]   ", total=None)
+        t2 = prog.add_task("[cyan]Git history[/cyan]        ", total=None)
+        t3 = prog.add_task("[cyan]Doc collection[/cyan]     ", total=None)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            f1 = executor.submit(analyze_repo, repo_path, workers=workers)
+            f2 = executor.submit(analyze_git, repo_path)
+            f3 = executor.submit(collect_docs, repo_path)
+
+            graph   = f1.result(); prog.update(t1, completed=True)
+            history = f2.result(); prog.update(t2, completed=True)
+            corpus  = f3.result(); prog.update(t3, completed=True)
 
     summary = summarize_graph(graph)
     console.print(
-        f"  Files: [cyan]{summary['total_files']}[/cyan]  "
+        f"  [dim]Static:[/dim]  "
+        f"Files: [cyan]{summary['total_files']}[/cyan]  "
         f"Edges: [cyan]{summary['total_edges']}[/cyan]  "
         f"Entry points: [cyan]{len(summary['entry_points'])}[/cyan]  "
         f"Circular deps: [cyan]{summary['circular_deps']}[/cyan]"
     )
-    console.print(f"  Languages: {summary['languages']}")
-
-    # -----------------------------------------------------------------------
-    # Stage 2: Git history
-    # -----------------------------------------------------------------------
-    _step("Stage 2 -- Git history analysis")
-    from onboard.stages.git_analysis import analyze_git
-
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeElapsedColumn(),
-                  console=console) as prog:
-        t = prog.add_task("Reading git log...", total=None)
-        history = analyze_git(repo_path)
-        prog.update(t, completed=True)
-
+    console.print(f"  [dim]         [/dim]  Languages: {summary['languages']}")
     console.print(
-        f"  Commits analysed: [cyan]{history.total_commits}[/cyan]  "
+        f"  [dim]Git:    [/dim]  "
+        f"Commits: [cyan]{history.total_commits}[/cyan]  "
         f"Files tracked: [cyan]{len(history.files)}[/cyan]"
     )
     if history.major_themes:
-        console.print(f"  Themes: {', '.join(history.major_themes[:8])}")
-
-    # -----------------------------------------------------------------------
-    # Stage 3: Doc collection
-    # -----------------------------------------------------------------------
-    _step("Stage 3 -- Documentation fragments")
-    from onboard.stages.doc_collector import collect_docs
-
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeElapsedColumn(),
-                  console=console) as prog:
-        t = prog.add_task("Collecting docs & docstrings...", total=None)
-        corpus = collect_docs(repo_path)
-        prog.update(t, completed=True)
-
+        console.print(f"  [dim]         [/dim]  Themes: {', '.join(history.major_themes[:8])}")
     console.print(
-        f"  Fragments: [cyan]{len(corpus.fragments)}[/cyan]  "
+        f"  [dim]Docs:   [/dim]  "
+        f"Fragments: [cyan]{len(corpus.fragments)}[/cyan]  "
         f"READMEs: [cyan]{len(corpus.readmes())}[/cyan]  "
         f"Arch docs: [cyan]{len(corpus.arch_docs())}[/cyan]"
     )
