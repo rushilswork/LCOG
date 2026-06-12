@@ -1,39 +1,44 @@
 # Legacy Codebase Onboarding Generator
 
-Turn any legacy codebase into a structured, navigable onboarding guide — the kind a senior engineer would write, but generated automatically.
-
-Existing tools give you call graphs *or* code explanations *or* git analytics. This tool synthesises all three into a human-readable narrative with a suggested reading order, hotspot warnings, dead code flags, and a Mermaid dependency graph — all served as a searchable MkDocs static site.
+A CLI tool that analyses a git repository and generates a searchable MkDocs site explaining how the codebase works — module by module, in the order you should read it.
 
 ---
 
-## Features
+## What it does
 
-**4-stage analysis pipeline**
+Most codebases have no onboarding docs. The ones that do have them scattered across READMEs, wikis, and tribal knowledge. This tool pulls everything together: the code structure, the git history, the existing comments, and uses an LLM to write a walkthrough for each module.
 
-- **Static structure mapping** — tree-sitter AST parsing across Python, JavaScript, TypeScript, C/C++, and Java. Extracts classes, functions, import relationships, and entry points. Builds a module dependency graph.
-- **Git history analysis** — identifies hotspots (frequently changed files), co-change coupling (files that always change together), dead code candidates (untouched for 2+ years), ownership by author, and recurring themes from commit messages.
-- **Documentation fragment collection** — finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the source files they describe.
-- **LLM narrative generation** — feeds each module's structure, history, and docs into an LLM and generates a walkthrough explaining what the module does, how it fits in, key design decisions, patterns to follow, and pitfalls to avoid.
+The output is a static site with:
 
-**Generated site**
-
-- System overview page with an interactive Mermaid dependency graph
-- Per-module walkthrough pages with hotspot and dead code callouts
-- Guided tour — a step-by-step reading sequence from entry point inward
-- Full-text search across all narratives (via MkDocs Material)
-- Regeneratable as the codebase evolves
-
-**Provider flexibility** — works with Groq (fast, free tier) or Google Gemini (free tier). No Anthropic dependency.
+- A dependency graph of the codebase (Mermaid)
+- A suggested reading order — dependencies before the files that use them, hotspots surfaced early
+- A per-module page: what it does, how it fits, design decisions, pitfalls
+- Dead code callouts (files untouched for 2+ years)
+- Hotspot warnings (files that change constantly — high risk to touch)
+- A guided tour that walks you through the whole thing in sequence
+- Full-text search
 
 ---
 
-## Supported languages
+## How it works
 
-Python, JavaScript, TypeScript, C, C++, Java
+Four stages run in sequence:
+
+**Stage 1 — Static analysis**
+Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, C/C++, and Java. Builds a directed dependency graph.
+
+**Stage 2 — Git history**
+Reads the git log to compute change frequency per file, co-change coupling (files that always change together), author ownership, and recurring themes from commit messages.
+
+**Stage 3 — Doc collection**
+Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the files they describe.
+
+**Stage 4 — LLM narratives**
+Sends each module's structure + history + docs to an LLM. Gets back a walkthrough covering what the module does, how it connects to the rest of the system, key design decisions, patterns to follow, and what to watch out for.
 
 ---
 
-## Installation
+## Setup
 
 ```bash
 pip install -e .
@@ -46,130 +51,50 @@ Requires Python 3.10+.
 
 ## Usage
 
-### With Groq (default)
-
-Get a free API key at [console.groq.com](https://console.groq.com).
-
 ```bash
+# Groq (default)
 export GROQ_API_KEY=gsk_...
-onboard analyze /path/to/your/repo --output ./guide
+onboard analyze /path/to/repo --output ./guide
 cd guide && mkdocs serve
-```
 
-### With Gemini
-
-Get a free API key at [aistudio.google.com](https://aistudio.google.com).
-
-```bash
+# Gemini
 export GEMINI_API_KEY=AIza...
-onboard analyze /path/to/your/repo --provider gemini --output ./guide
-```
+onboard analyze /path/to/repo --provider gemini --output ./guide
 
-### Without any API key (stub mode)
-
-Runs the full static analysis and git history pipeline and generates a structured site with placeholder narratives — useful for previewing the structure or testing.
-
-```bash
-onboard analyze /path/to/your/repo --skip-llm --output ./guide
-```
-
-### Serve an existing guide
-
-```bash
-onboard serve ./guide
+# No API key — runs stages 1-3 and generates stub narratives
+onboard analyze /path/to/repo --skip-llm --output ./guide
 ```
 
 ---
 
-## All options
+## Options
 
 ```
 onboard analyze <repo_path> [OPTIONS]
 
-Arguments:
-  repo_path     Path to the git repository to analyse
-
-Options:
-  -o, --output DIR        Output directory for the MkDocs site  [default: onboarding-guide]
-  --provider TEXT         LLM provider: groq or gemini          [default: groq]
-  --api-key TEXT          API key (overrides env var)
+  -o, --output DIR        Where to write the site          [default: onboarding-guide]
+  --provider TEXT         groq or gemini                   [default: groq]
+  --api-key TEXT          API key (or use env var)
   --model TEXT            Override the default model
-  --site-name TEXT        Title for the generated site
-  --max-modules INT       Cap on modules sent to the LLM        [default: 50]
-  --skip-llm              Generate stub narratives without calling any LLM
-  --serve                 Run mkdocs serve immediately after generation
+  --site-name TEXT        Site title
+  --max-modules INT       Max modules sent to LLM          [default: 50]
+  --skip-llm              Skip LLM stage, stub narratives only
+  --serve                 Run mkdocs serve after generation
 ```
 
-**Default models**
+**Providers and defaults**
 
-| Provider | Default model              | Notes                        |
-|----------|---------------------------|------------------------------|
-| groq     | llama-3.3-70b-versatile   | Fast, generous free tier     |
-| gemini   | gemini-1.5-flash          | Free tier, 1M token context  |
+| Provider | Default model             | Free tier |
+|----------|--------------------------|-----------|
+| groq     | llama-3.3-70b-versatile  | Yes       |
+| gemini   | gemini-1.5-flash         | Yes       |
 
-**Environment variables**
-
-| Variable        | Used by          |
-|-----------------|------------------|
-| `GROQ_API_KEY`  | `--provider groq`   |
-| `GEMINI_API_KEY`| `--provider gemini` |
+**Env vars:** `GROQ_API_KEY`, `GEMINI_API_KEY`
 
 ---
 
-## How it works
+## Notes
 
-```
-repo/
-  └── source files
-        |
-        v
-  [Stage 1] tree-sitter AST walk
-        |-- module dependency graph (networkx DiGraph)
-        |-- symbols: classes, functions, entry points
-        |
-  [Stage 2] git log analysis
-        |-- hotspot scores (change frequency)
-        |-- co-change coupling matrix
-        |-- dead code candidates (>2 years untouched)
-        |-- commit message theme clustering
-        |
-  [Stage 3] doc fragment collection
-        |-- READMEs, ARCHITECTURE.md, CHANGELOG.md
-        |-- Python docstrings, JSDoc, Doxygen comments
-        |
-  [Stage 4] LLM narrative generation
-        |-- per-module prompts: structure + history + docs
-        |-- reading order: topological sort + hotspot tiebreaking
-        |-- system overview, guided tour
-        |
-  [Output] MkDocs static site
-        |-- docs/index.md        (overview + Mermaid graph)
-        |-- docs/guided_tour.md  (step-by-step tour)
-        |-- docs/modules/*.md    (per-module pages)
-        |-- mkdocs.yml
-```
-
----
-
-## Project structure
-
-```
-onboard/
-  cli.py                   Entry point (click CLI)
-  stages/
-    static_analysis.py     Stage 1: tree-sitter AST parsing
-    git_analysis.py        Stage 2: git history metrics
-    doc_collector.py       Stage 3: documentation fragments
-    narrative_gen.py       Stage 4: LLM narrative generation
-  output/
-    mkdocs_builder.py      MkDocs site generation
-```
-
----
-
-## Tips
-
-- **Large repos**: use `--max-modules 20` on the first run to keep API costs low, then increase.
-- **Cost estimate**: each module uses roughly 1,000–2,000 tokens. At 50 modules that is ~100K tokens — well within Groq and Gemini free tier limits.
-- **Regenerating**: re-run the same command with the same `--output` directory to update the guide as the codebase evolves.
-- **Reading order**: the guided tour is sorted so you read dependencies before the files that use them, with hotspots prioritised early so you understand the most critical code first.
+- Use `--max-modules 20` on a first pass against a large repo to keep costs low.
+- At 50 modules, expect roughly 75-100K tokens total — within both providers' free tiers.
+- Re-run with the same `--output` directory to refresh the guide as the codebase changes.
