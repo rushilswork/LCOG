@@ -10,8 +10,10 @@ Most codebases have no onboarding docs. The ones that do have them scattered acr
 
 The output is a static site with:
 
-- An interactive dependency graph — zoom, pan, drag nodes, click to open any module page
+- An interactive dependency graph — zoom, pan, drag, click to open any module page; nodes colour-coded by top-level directory with a live legend and directory filter
 - A static Mermaid dependency graph with clickable nodes
+- A file tree page — every parsed source file listed by directory, with hotspot 🔥 and dead code 💀 badges, narrated files linked directly to their module page
+- A directory overview page per top-level package — file counts, module table, aggregate hotspot/dead-code stats
 - A suggested reading order — dependencies first, hotspots surfaced early
 - A per-module page: what it does, how it fits, design decisions, pitfalls
 - Dead code callouts (files untouched for 2+ years)
@@ -23,7 +25,7 @@ The output is a static site with:
 
 ## How it works
 
-Stages 1–3 run **in parallel** (they are fully independent). Stage 4 starts once all three finish.
+Stages 1–3 run **in parallel** (they are fully independent). Stage 4 starts once all three finish. Each stage shows its own elapsed time as it completes, and the parallel wall-clock total is printed at the end.
 
 **Stage 1 — Static analysis**
 Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, TSX, C/C++, and Java. Files are parsed in parallel using a thread pool (tree-sitter releases the GIL, so threads run on real cores). Builds a directed dependency graph. Files larger than 500 KB and standard noise directories (`node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.) are skipped automatically.
@@ -79,20 +81,25 @@ You only need bindings for languages actually present in the target repo. Missin
 
 ### Without AI (no API key needed)
 
-Stages 1–3 run in parallel. You get the full interactive dependency graph, static Mermaid graph, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages show stubs instead of LLM prose.
+Stages 1–3 run in parallel. You get the full interactive dependency graph, static Mermaid graph, file tree, directory overviews, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages show stubs instead of LLM prose.
 
 ```bash
 onboard analyze /path/to/repo --skip-llm
 ```
 
-The guide is written to `<repo>/onboarding-guide` by default. Then serve it:
+The guide is written to `<repo>/onboarding-guide` by default. Pass `--serve` to launch MkDocs and open the browser automatically:
 
 ```bash
-cd /path/to/repo/onboarding-guide
-mkdocs serve
+onboard analyze /path/to/repo --skip-llm --serve
 ```
 
-Open `http://127.0.0.1:8000`.
+Or serve an already-generated guide:
+
+```bash
+onboard serve /path/to/repo/onboarding-guide
+```
+
+Both commands open `http://127.0.0.1:8000` in your browser automatically after a 2-second startup delay.
 
 ---
 
@@ -108,13 +115,11 @@ All four stages run. The LLM writes actual narratives for every module, a system
 ```bash
 # Windows
 set GROQ_API_KEY=gsk_...
-onboard analyze C:\path\to\repo
-cd C:\path\to\repo\onboarding-guide && mkdocs serve
+onboard analyze C:\path\to\repo --serve
 
 # Mac / Linux
 export GROQ_API_KEY=gsk_...
-onboard analyze /path/to/repo
-cd /path/to/repo/onboarding-guide && mkdocs serve
+onboard analyze /path/to/repo --serve
 ```
 
 **Option 2: Gemini** (free tier available, no card required)
@@ -125,11 +130,11 @@ cd /path/to/repo/onboarding-guide && mkdocs serve
 ```bash
 # Windows
 set GEMINI_API_KEY=AIza...
-onboard analyze C:\path\to\repo --provider gemini
+onboard analyze C:\path\to\repo --provider gemini --serve
 
 # Mac / Linux
 export GEMINI_API_KEY=AIza...
-onboard analyze /path/to/repo --provider gemini
+onboard analyze /path/to/repo --provider gemini --serve
 ```
 
 ---
@@ -146,7 +151,7 @@ onboard analyze <repo_path> [OPTIONS]
   --site-name TEXT        Site title
   --max-modules INT       Max modules sent to LLM  [default: 50]
   --skip-llm              Run stages 1-3 only, no LLM
-  --serve                 Run mkdocs serve after generation
+  --serve                 Run mkdocs serve after generation and open browser
   --workers INT           Parallel workers for file parsing  [default: auto]
 ```
 
@@ -161,11 +166,27 @@ onboard analyze <repo_path> [OPTIONS]
 
 **Env vars:** `GROQ_API_KEY`, `GEMINI_API_KEY`
 
-To serve an already-generated guide without regenerating:
+---
 
-```bash
-onboard serve /path/to/repo/onboarding-guide
+## Generated site structure
+
 ```
+<repo>/onboarding-guide/
+  mkdocs.yml
+  docs/
+    index.md           ← system overview, Mermaid graph, reading order
+    guided_tour.md     ← LLM-narrated walkthrough of the whole codebase
+    file_tree.md       ← every parsed file, grouped by directory, with badges
+    graph.html         ← interactive vis.js dependency graph
+    dirs/
+      <dir>.md         ← one overview page per top-level package
+    modules/
+      <slug>.md        ← per-module page: summary, walkthrough, design notes
+    css/
+      extra.css
+```
+
+The MkDocs nav groups modules under their top-level directory automatically. On repos where all modules live in a single directory the nav stays flat.
 
 ---
 
@@ -173,11 +194,20 @@ onboard serve /path/to/repo/onboarding-guide
 
 The generated site includes a full interactive dependency graph (`graph.html`) accessible via the "Open interactive graph" button on the home page.
 
+**Layout**
 - **Force-directed** — nodes settle organically; edges act like springs
 - **Hierarchical (top-down)** — strict top-to-bottom layout; entry points at top, shared utilities at bottom
-- **Fit to screen** — zoom to fit all nodes in view
-- **Freeze / Unfreeze** — lock node positions once the layout has settled
-- **Search** — type a module name to dim everything else
+
+**Toolbar**
+- **Colour legend** — each top-level directory gets a distinct colour; entry points are always salmon/pink regardless of directory
+- **Directory filter** — select a directory from the dropdown to highlight only those nodes; all other nodes dim to near-invisible. Combines with search.
+- **Search** — type a module name to dim everything else; matches on both display label (`auth/manager`) and full path
+- **Hover tooltip** — shows the full file path (`src/core/auth/manager.py`) on hover
+- **Fit to screen / Freeze** — lock positions once the layout has settled
+
+**Node labels** show `parent_dir/stem` (e.g. `auth/manager`) so files with the same name in different packages are immediately distinguishable.
+
+**Performance cap:** On repos with more than 200 parsed files, the graph shows the top 200 by connectivity (highest-degree nodes). The rest appear in the file tree page.
 
 Click any node to open that module's page.
 
@@ -189,6 +219,7 @@ Click any node to open that module's page.
 - Re-run the same command against the same repo to refresh the guide as the codebase changes. The output directory is overwritten in place.
 - The `onboarding-guide` output directory is excluded from analysis, so running the tool on its own repo won't recurse.
 - Repos with no git history, bare repos, or repos on machines without git installed all run fine — Stage 2 degrades gracefully and returns empty history.
+- The interactive graph requires an internet connection to load vis.js from the unpkg CDN. All other pages are fully offline once generated.
 
 ---
 
@@ -207,3 +238,5 @@ Click any node to open that module's page.
 **Windows encoding errors in terminal** — set `PYTHONUTF8=1` before running: `set PYTHONUTF8=1 && onboard analyze ...`
 
 **Stage 1 seems slow on first run** — tree-sitter compiles language grammars on first use and caches them. Subsequent runs are faster.
+
+**Graph shows fewer nodes than expected** — the interactive graph caps at 200 nodes (top by connectivity). All files appear in the File Tree page regardless of the cap.

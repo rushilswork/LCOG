@@ -11,7 +11,7 @@ Options:
     --site-name TEXT     Title for the generated site
     --max-modules INT    Cap on modules sent to the LLM        [default: 50]
     --skip-llm           Generate stub narratives without calling any LLM
-    --serve              Run `mkdocs serve` after generation
+    --serve              Run `mkdocs serve` after generation and open browser
     --workers INT        Parallel workers for file parsing (0=auto)
 """
 
@@ -20,6 +20,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time as _time
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -46,6 +49,11 @@ def _step(label: str):
     console.rule(f"[bold]{label}[/bold]")
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
 @click.group()
 def main():
     """Generate a structured onboarding guide for a legacy codebase."""
@@ -70,7 +78,7 @@ def main():
 @click.option("--skip-llm", is_flag=True, default=False,
               help="Skip LLM stage; produce stub narratives only")
 @click.option("--serve", is_flag=True, default=False,
-              help="Run `mkdocs serve` after generation")
+              help="Run `mkdocs serve` after generation and open browser automatically")
 @click.option("--workers", default=0, show_default=True, type=int,
               help="Parallel workers for file parsing (0=auto, uses CPU count)")
 def analyze(
@@ -108,13 +116,15 @@ def analyze(
     output = (output or repo_path / "onboarding-guide").resolve()
 
     # -----------------------------------------------------------------------
-    # Stages 1–3: run in parallel (all are independent of each other)
+    # Stages 1-3: run in parallel (all are independent of each other)
     # -----------------------------------------------------------------------
     _step("Stages 1-3 -- Analysis (parallel)")
 
     from onboard.stages.static_analysis import analyze_repo, summarize_graph
     from onboard.stages.git_analysis import analyze_git
     from onboard.stages.doc_collector import collect_docs
+
+    _parallel_start = _time.monotonic()
 
     with Progress(
         SpinnerColumn(),
@@ -126,14 +136,39 @@ def analyze(
         t2 = prog.add_task("[cyan]Git history[/cyan]        ", total=None)
         t3 = prog.add_task("[cyan]Doc collection[/cyan]     ", total=None)
 
+        def _mark_done(fut, task_id: int, label: str) -> None:
+            """Callback: fires from the worker thread the instant a stage finishes."""
+            elapsed = _time.monotonic() - _parallel_start
+            t_str = _fmt_elapsed(elapsed)
+            prog.stop_task(task_id)
+            try:
+                failed = fut.exception() is not None
+            except Exception:
+                # CancelledError or anything else -- treat as success;
+                # the real error will surface when .result() is called.
+                failed = False
+            if failed:
+                prog.update(task_id,
+                    description=f"[red]X {label}[/red]  [dim]({t_str})[/dim]")
+            else:
+                prog.update(task_id,
+                    description=f"[green]done {label}[/green]  [dim]({t_str})[/dim]")
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             f1 = executor.submit(analyze_repo, repo_path, workers=workers)
             f2 = executor.submit(analyze_git, repo_path)
             f3 = executor.submit(collect_docs, repo_path)
 
-            graph   = f1.result(); prog.update(t1, completed=True)
-            history = f2.result(); prog.update(t2, completed=True)
-            corpus  = f3.result(); prog.update(t3, completed=True)
+            f1.add_done_callback(lambda f: _mark_done(f, t1, "Static analysis"))
+            f2.add_done_callback(lambda f: _mark_done(f, t2, "Git history    "))
+            f3.add_done_callback(lambda f: _mark_done(f, t3, "Doc collection "))
+
+            graph   = f1.result()
+            history = f2.result()
+            corpus  = f3.result()
+
+    _parallel_total = _time.monotonic() - _parallel_start
+    console.print(f"  [dim]Parallel wall time: {_fmt_elapsed(_parallel_total)}[/dim]")
 
     summary = summarize_graph(graph)
     console.print(
@@ -232,7 +267,14 @@ def analyze(
 
     if serve:
         try:
-            subprocess.run(["mkdocs", "serve"], cwd=output, check=False)
+            proc = subprocess.Popen(["mkdocs", "serve"], cwd=output)
+            # Open browser after a short delay to let mkdocs finish starting up
+            def _launch_browser():
+                _time.sleep(2)
+                webbrowser.open("http://127.0.0.1:8000")
+            threading.Thread(target=_launch_browser, daemon=True).start()
+            console.print("  [dim]Opening browser at http://127.0.0.1:8000 ...[/dim]")
+            proc.wait()
         except FileNotFoundError:
             console.print(
                 "[red]Error:[/red] mkdocs not found. "
@@ -247,7 +289,13 @@ def serve(guide_dir: Path):
     """Serve an existing onboarding guide with MkDocs."""
     console.print(f"Serving [bold]{guide_dir}[/bold]...")
     try:
-        subprocess.run(["mkdocs", "serve"], cwd=guide_dir, check=False)
+        proc = subprocess.Popen(["mkdocs", "serve"], cwd=guide_dir)
+        def _launch_browser():
+            _time.sleep(2)
+            webbrowser.open("http://127.0.0.1:8000")
+        threading.Thread(target=_launch_browser, daemon=True).start()
+        console.print("  [dim]Opening browser at http://127.0.0.1:8000 ...[/dim]")
+        proc.wait()
     except FileNotFoundError:
         console.print(
             "[red]Error:[/red] mkdocs not found. "
