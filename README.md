@@ -86,8 +86,8 @@ onboard analyze <repo_path> [OPTIONS]
 
 | Provider | Default model             | Free tier |
 |----------|--------------------------|-----------|
-| groq     | llama-3.3-70b-versatile  | Yes       |
-| gemini   | gemini-1.5-flash         | Yes       |
+| groq     | llama-3.3-70b-versatile  | Free, no card required |
+| gemini   | gemini-1.5-flash         | Free, no card required |
 
 **Env vars:** `GROQ_API_KEY`, `GEMINI_API_KEY`
 
@@ -95,6 +95,6 @@ onboard analyze <repo_path> [OPTIONS]
 
 ## Notes
 
-- Use `--max-modules 20` on a first pass against a large repo to keep costs low.
+- Use `--max-modules 20` on a first pass against a large repo if you hit rate limits on the free tier.
 - At 50 modules, expect roughly 75-100K tokens total — within both providers' free tiers.
 - Re-run with the same `--output` directory to refresh the guide as the codebase changes.
