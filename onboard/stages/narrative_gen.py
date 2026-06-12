@@ -39,8 +39,8 @@ from onboard.stages.static_analysis import Symbol
 # ---------------------------------------------------------------------------
 
 PROVIDER_DEFAULTS: dict[str, dict] = {
-    "groq":   {"model": "llama-3.3-70b-versatile", "max_tokens": 1500},
-    "gemini": {"model": "gemini-1.5-flash",         "max_tokens": 1500},
+    "groq":   {"model": "llama-3.3-70b-versatile", "max_tokens": 2500},
+    "gemini": {"model": "gemini-1.5-flash",         "max_tokens": 2500},
 }
 
 # Max concurrent LLM requests (tune down if hitting rate limits)
@@ -62,6 +62,13 @@ class ModuleNarrative:
     dead_code_warning: Optional[str] = None
     hotspot_warning: Optional[str] = None
     reading_order_index: int = 0
+    patterns: str = ""
+    architecture_notes: str = ""
+    entry_points_usage: str = ""
+    code_walkthrough: str = ""
+    sequence_diagram: str = ""       # Mermaid sequenceDiagram (AI, conditional)
+    state_machine_diagram: str = ""  # Mermaid stateDiagram (AI, conditional)
+    data_flow_snippet: str = ""      # Mermaid flowchart for this module's data flow (AI, conditional)
 
 
 @dataclass
@@ -71,6 +78,13 @@ class OnboardingGuide:
     modules: dict[str, ModuleNarrative] = field(default_factory=dict)
     guided_tour: str = ""
     major_themes: list[str] = field(default_factory=list)
+    # ── New: architecture docs ──────────────────────────────────────────
+    arc42: str = ""                          # full Arc42 document (markdown)
+    c4_context_mermaid: str = ""             # C4Context diagram for home page
+    c4_container_mermaid: str = ""           # C4Container diagram (inside arc42)
+    domain_model_mermaid: str = ""           # ER / domain model diagram
+    data_flow_mermaid: str = ""              # Data Flow Diagram
+    dir_c4_components: dict[str, str] = field(default_factory=dict)  # dir → C4Component mermaid
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +153,21 @@ def _extract_section(text: str, heading: str) -> str:
     start = text.find("\n", start) + 1
     end = text.find("## ", start)
     return text[start:end].strip() if end != -1 else text[start:].strip()
+
+
+def _extract_mermaid(text: str, diagram_type: str) -> str:
+    """Extract the first Mermaid block of a given type from LLM output.
+
+    diagram_type examples: 'sequenceDiagram', 'stateDiagram', 'flowchart',
+    'C4Context', 'C4Container', 'C4Component', 'erDiagram'
+    """
+    # Match ```mermaid ... ``` blocks containing the diagram type
+    pattern = r"```mermaid\s*\n(.*?)```"
+    for match in re.finditer(pattern, text, re.DOTALL):
+        body = match.group(1)
+        if diagram_type.lower() in body.lower():
+            return f"```mermaid\n{body.rstrip()}\n```"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +274,182 @@ GRAPH CONTEXT:
   Dependants (files that import this): {dependants}
   Dependencies (files this imports):   {dependencies}
 
-Write a concise onboarding walkthrough. Use these exact section headings:
+SOURCE CODE:
+{source_code}
+
+Write a comprehensive onboarding guide. Use these exact section headings:
 
 ## What this module does
 ## How it fits into the system
+## Architecture notes
 ## Key design decisions
+## How to use this module
+## Code walkthrough
 ## Patterns to follow
 ## Pitfalls to avoid
 
-Be concrete. Use the file name and symbol names. Avoid generic advice.
+Guidelines:
+- "Architecture notes": explain the architectural pattern/paradigm used (e.g. repository pattern, event-driven, middleware chain, factory, etc.) and WHY that choice was made.
+- "How to use this module": show the primary entry points, key public API, and a short usage example if applicable.
+- "Code walkthrough": walk through the actual source code section by section (e.g. "Lines 1-20: imports and constants", "Lines 22-45: class X does Y"). Reference actual function/class names and line numbers.
+- Be concrete. Use the file name and symbol names. Avoid generic advice.
+"""
+
+# ── Sequence / state / DFD addition (appended to MODULE_PROMPT when triggered) ──
+MODULE_DIAGRAM_ADDENDUM = """
+Additionally, if this module has complex behaviour, generate ONE OR MORE of the
+following Mermaid diagrams — only when genuinely applicable:
+
+If the module orchestrates a meaningful multi-step flow (e.g. handles requests,
+processes jobs, runs a pipeline), add:
+
+## Sequence diagram
+```mermaid
+sequenceDiagram
+    ...
+```
+
+If the module manages lifecycle state (e.g. order status, job status, connection
+state), add:
+
+## State machine
+```mermaid
+stateDiagram-v2
+    ...
+```
+
+If the module transforms or routes data through multiple steps, add:
+
+## Data flow
+```mermaid
+flowchart LR
+    ...
+```
+
+Omit any diagram that does not apply. Do NOT invent behaviour — only diagram
+what the source code clearly shows.
+"""
+
+ARC42_PROMPT = """\
+You are a senior software architect writing an Arc42 architecture document for
+a new team member joining this project.
+
+SYSTEM NAME: {system_name}
+LANGUAGES: {languages}
+FRAMEWORKS: {frameworks}
+EXTERNAL SYSTEMS: {external_systems}
+ENTRY POINTS: {entry_points}
+TOP HOTSPOTS: {hotspots}
+MAJOR THEMES FROM GIT: {themes}
+ARCHITECTURE DOCS FOUND: {arch_docs}
+PACKAGE STRUCTURE: {packages}
+READING ORDER (top modules): {reading_order}
+
+Write a complete Arc42 document using EXACTLY these section headings (all 12):
+
+## 1. Introduction and Goals
+## 2. Constraints
+## 3. Context and Scope
+## 4. Solution Strategy
+## 5. Building Block View
+## 6. Runtime View
+## 7. Deployment View
+## 8. Cross-cutting Concepts
+## 9. Architecture Decisions
+## 10. Quality Requirements
+## 11. Risks and Technical Debt
+## 12. Glossary
+
+Rules:
+- Section 3 MUST contain a Mermaid C4Context diagram inside ```mermaid fences
+- Section 5 MUST contain a Mermaid C4Container diagram inside ```mermaid fences
+- Section 6 MUST contain at least one Mermaid sequenceDiagram showing a key runtime flow
+- Use actual file names, class names, and module names from the context above
+- Section 11 should reference the hotspot files by name
+- Section 12 should define 5-10 domain terms found in the symbol/module names
+- Be specific and technical — avoid boilerplate generic text
+"""
+
+DOMAIN_MODEL_PROMPT = """\
+You are a senior software architect extracting the domain model from a codebase.
+
+SYSTEM NAME: {system_name}
+LANGUAGES: {languages}
+TOP-LEVEL CLASSES AND ENTITIES:
+{entities}
+DATABASE / ORM IMPORTS: {db_imports}
+TOP MODULE NAMES: {modules}
+
+Generate:
+
+## Domain overview
+2-3 paragraphs describing the core domain concepts and their relationships.
+
+## Entity-relationship diagram
+A Mermaid erDiagram showing the key domain entities and their relationships:
+```mermaid
+erDiagram
+    ...
+```
+
+## Key entities
+For each major entity: one sentence on its role in the domain.
+
+Use actual class and module names from the context. Only model entities that
+clearly exist in the code — do not invent domain concepts.
+"""
+
+DFD_PROMPT = """\
+You are a senior software architect documenting data flow through a system.
+
+SYSTEM NAME: {system_name}
+FRAMEWORKS: {frameworks}
+EXTERNAL SYSTEMS: {external_systems}
+ENTRY POINTS: {entry_points}
+DATA-RELATED MODULES (sorted by centrality):
+{data_modules}
+PACKAGE STRUCTURE: {packages}
+
+Generate:
+
+## Data flow overview
+2-3 paragraphs describing how data enters, moves through, and exits the system.
+
+## Data flow diagram
+A Mermaid flowchart showing data sources → processing layers → outputs/sinks:
+```mermaid
+flowchart TD
+    ...
+```
+
+## Key transformations
+For each major data transformation: what goes in, what comes out, which module handles it.
+
+Be specific — use actual module names and external system names from the context.
+"""
+
+C4_COMPONENT_PROMPT = """\
+You are a senior software architect writing a C4 Level 3 Component diagram.
+
+PACKAGE: {package_name}
+FILES IN THIS PACKAGE:
+{files}
+IMPORTS FROM OTHER PACKAGES: {external_imports}
+IMPORTED BY: {imported_by}
+
+Generate:
+
+## Package overview
+1-2 sentences on this package's role in the overall system.
+
+## Component diagram
+A Mermaid C4Component diagram showing the components inside this package:
+```mermaid
+C4Component
+    ...
+```
+
+Use actual file/class names. Keep to the real components — don't invent structure.
 """
 
 OVERVIEW_PROMPT = """\
@@ -317,6 +513,20 @@ def _reading_order(graph: nx.DiGraph, history: RepoHistory, entry_points: list[s
 # Per-module generation helper (thread-safe, no shared mutable state)
 # ---------------------------------------------------------------------------
 
+_SOURCE_CODE_CHAR_LIMIT = 6000  # ~1500 tokens; keeps prompts manageable
+
+
+def _read_source(repo_path: Path, rel_path: str) -> str:
+    """Read source from disk, capped at _SOURCE_CODE_CHAR_LIMIT chars."""
+    try:
+        full = (repo_path / rel_path).read_text(encoding="utf-8", errors="replace")
+        if len(full) > _SOURCE_CODE_CHAR_LIMIT:
+            return full[:_SOURCE_CODE_CHAR_LIMIT] + f"\n... (truncated at {_SOURCE_CODE_CHAR_LIMIT} chars)"
+        return full
+    except OSError:
+        return "(source file not readable)"
+
+
 def _generate_module(
     path: str,
     graph: nx.DiGraph,
@@ -326,6 +536,7 @@ def _generate_module(
     api_key: str,
     model: str,
     max_tokens: int,
+    repo_path: Optional[Path] = None,
 ) -> tuple[str, ModuleNarrative, Optional[str]]:
     """Generate narrative for one module. Designed to run inside a thread pool.
 
@@ -340,10 +551,24 @@ def _generate_module(
     dependants = list(graph.predecessors(path))
     dependencies = list(graph.successors(path))
 
+    source_code = _read_source(repo_path, path) if repo_path else "(source not available)"
+
+    # Determine if this module warrants extra diagrams:
+    # hotspots, complex symbol counts, or name hints at state/flow/pipeline
+    _name_lower = Path(path).stem.lower()
+    _diagram_hints = ("state", "flow", "pipeline", "process", "handler",
+                      "worker", "job", "task", "service", "manager", "engine",
+                      "router", "controller", "middleware", "dispatcher")
+    _needs_diagrams = (
+        (fh and fh.change_frequency > 20)
+        or len(symbols) > 8
+        or any(h in _name_lower for h in _diagram_hints)
+    )
+
     # _esc() is CRITICAL: docstrings, commit messages, and symbol names
     # regularly contain { } (dicts, generics, format strings, etc.) which
     # would cause KeyError/IndexError in str.format() without escaping.
-    prompt = MODULE_PROMPT.format(
+    prompt_base = MODULE_PROMPT.format(
         path=_esc(path),
         language=_esc(lang),
         symbols=_esc(_symbol_summary(symbols)),
@@ -352,7 +577,9 @@ def _generate_module(
         docs=_esc(_doc_fragments_text(path, corpus)),
         dependants=_esc(", ".join(dependants[:10]) or "none"),
         dependencies=_esc(", ".join(dependencies[:10]) or "none"),
+        source_code=_esc(source_code),
     )
+    prompt = prompt_base + (MODULE_DIAGRAM_ADDENDUM if _needs_diagrams else "")
 
     try:
         raw = _call_llm(prompt, provider, api_key, model, max_tokens)
@@ -389,11 +616,205 @@ def _generate_module(
         walkthrough=_extract_section(raw, "How it fits into the system"),
         design_notes=_extract_section(raw, "Key design decisions"),
         pitfalls=_extract_section(raw, "Pitfalls to avoid"),
+        patterns=_extract_section(raw, "Patterns to follow"),
+        architecture_notes=_extract_section(raw, "Architecture notes"),
+        entry_points_usage=_extract_section(raw, "How to use this module"),
+        code_walkthrough=_extract_section(raw, "Code walkthrough"),
+        sequence_diagram=_extract_mermaid(raw, "sequenceDiagram"),
+        state_machine_diagram=_extract_mermaid(raw, "stateDiagram"),
+        data_flow_snippet=_extract_mermaid(raw, "flowchart"),
         dead_code_warning=dead_warn,
         hotspot_warning=hotspot_warn,
         reading_order_index=0,  # set by caller after collection
     )
     return path, narrative, err_logged
+
+
+# ---------------------------------------------------------------------------
+# Architecture doc generators (each makes one LLM call, gracefully degrades)
+# ---------------------------------------------------------------------------
+
+def _generate_arc42(
+    graph: nx.DiGraph,
+    history: RepoHistory,
+    corpus: DocCorpus,
+    tech: "TechContext",
+    reading_order: list[str],
+    provider: str,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    from onboard.stages.static_analysis import summarize_graph
+    summary = summarize_graph(graph)
+    hotspot_list = sorted(
+        history.files.values(), key=lambda fh: fh.change_frequency, reverse=True
+    )[:8]
+    hotspots_text = ", ".join(
+        f"{fh.path} ({fh.change_frequency} commits)" for fh in hotspot_list
+    ) or "none"
+    arch_docs = corpus.arch_docs()
+    arch_text = "\n".join(f.content[:400] for f in arch_docs[:3]) or "None found."
+    packages = sorted({
+        Path(n).parts[0] for n in graph.nodes() if len(Path(n).parts) > 1
+    })
+    packages_text = ", ".join(packages[:15]) or "flat structure"
+    nodes_list = list(graph.nodes())
+    sys_name = (
+        Path(nodes_list[0]).parts[0]
+        if nodes_list and len(Path(nodes_list[0]).parts) > 1 else "system"
+    )
+    prompt = ARC42_PROMPT.format(
+        system_name=_esc(sys_name),
+        languages=_esc(str(summary.get("languages", {}))),
+        frameworks=_esc(tech.frameworks_text()),
+        external_systems=_esc(tech.external_systems_text()),
+        entry_points=_esc(", ".join(summary.get("entry_points", [])[:8]) or "none"),
+        hotspots=_esc(hotspots_text),
+        themes=_esc(", ".join(history.major_themes[:10]) or "none"),
+        arch_docs=_esc(arch_text),
+        packages=_esc(packages_text),
+        reading_order=_esc(", ".join(reading_order[:10])),
+    )
+    try:
+        return _call_llm(prompt, provider, api_key, model, max_tokens)
+    except Exception as e:
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        return f"*Arc42 generation failed: {err_msg}*"
+
+
+def _generate_domain_model(
+    graph: nx.DiGraph,
+    tech: "TechContext",
+    provider: str,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    from onboard.stages.static_analysis import summarize_graph
+    from onboard.stages.static_analysis import Symbol
+    summary = summarize_graph(graph)
+    entity_lines = []
+    for node, data in list(graph.nodes(data=True))[:60]:
+        symbols: list[Symbol] = data.get("symbols", [])
+        classes = [s for s in symbols if s.kind == "class"]
+        for cls in classes[:5]:
+            entity_lines.append(f"  [{node}] {cls.name}")
+    entities_text = "\n".join(entity_lines[:40]) or "No class definitions found."
+    db_imports = [
+        imp for _node, data in graph.nodes(data=True)
+        for imp in data.get("imports", [])
+        if any(k in imp.lower() for k in ("model", "schema", "entity", "orm",
+                                           "sqlalchemy", "django.db", "peewee",
+                                           "tortoise", "mongoengine"))
+    ]
+    db_text = ", ".join(sorted(set(db_imports))[:10]) or "none detected"
+    nodes_list = list(graph.nodes())
+    sys_name = (
+        Path(nodes_list[0]).parts[0]
+        if nodes_list and len(Path(nodes_list[0]).parts) > 1 else "system"
+    )
+    top_modules = ", ".join(nodes_list[:10])
+    prompt = DOMAIN_MODEL_PROMPT.format(
+        system_name=_esc(sys_name),
+        languages=_esc(str(summary.get("languages", {}))),
+        entities=_esc(entities_text),
+        db_imports=_esc(db_text),
+        modules=_esc(top_modules),
+    )
+    try:
+        return _call_llm(prompt, provider, api_key, model, max_tokens)
+    except Exception as e:
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        return f"*Domain model generation failed: {err_msg}*"
+
+
+def _generate_dfd(
+    graph: nx.DiGraph,
+    tech: "TechContext",
+    provider: str,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    from onboard.stages.static_analysis import summarize_graph
+    summary = summarize_graph(graph)
+    centrality = sorted(
+        graph.nodes(), key=lambda n: graph.degree(n), reverse=True
+    )[:15]
+    data_modules_text = "\n".join(f"  {n}" for n in centrality) or "  (no graph data)"
+    packages = sorted({
+        Path(n).parts[0] for n in graph.nodes() if len(Path(n).parts) > 1
+    })
+    packages_text = ", ".join(packages[:15]) or "flat structure"
+    nodes_list = list(graph.nodes())
+    sys_name = (
+        Path(nodes_list[0]).parts[0]
+        if nodes_list and len(Path(nodes_list[0]).parts) > 1 else "system"
+    )
+    prompt = DFD_PROMPT.format(
+        system_name=_esc(sys_name),
+        frameworks=_esc(tech.frameworks_text()),
+        external_systems=_esc(tech.external_systems_text()),
+        entry_points=_esc(", ".join(summary.get("entry_points", [])[:8]) or "none"),
+        data_modules=_esc(data_modules_text),
+        packages=_esc(packages_text),
+    )
+    try:
+        return _call_llm(prompt, provider, api_key, model, max_tokens)
+    except Exception as e:
+        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+        return f"*Data flow generation failed: {err_msg}*"
+
+
+def _generate_c4_components(
+    graph: nx.DiGraph,
+    provider: str,
+    api_key: str,
+    model: str,
+    max_tokens: int,
+) -> dict[str, str]:
+    from collections import defaultdict as _defaultdict
+    dir_nodes: dict[str, list[str]] = _defaultdict(list)
+    for node in graph.nodes():
+        top = Path(node).parts[0] if len(Path(node).parts) > 1 else "_root_"
+        dir_nodes[top].append(node)
+    results: dict[str, str] = {}
+    for dir_name, files in dir_nodes.items():
+        if len(files) < 3:
+            continue
+        external_imports: set[str] = set()
+        for f in files:
+            data = graph.nodes.get(f, {})
+            for imp in data.get("imports", []):
+                root = imp.split(".")[0] if "." in imp else imp
+                if root and root != dir_name.replace("/", "."):
+                    external_imports.add(imp)
+        imported_by: set[str] = set()
+        for f in files:
+            for pred in graph.predecessors(f):
+                pred_dir = (
+                    Path(pred).parts[0] if len(Path(pred).parts) > 1 else "_root_"
+                )
+                if pred_dir != dir_name:
+                    imported_by.add(pred_dir)
+        files_text = "\n".join(f"  {f}" for f in sorted(files)[:20])
+        ext_text = ", ".join(sorted(external_imports)[:15]) or "none"
+        iby_text = ", ".join(sorted(imported_by)[:10]) or "none"
+        prompt = C4_COMPONENT_PROMPT.format(
+            package_name=_esc(dir_name),
+            files=_esc(files_text),
+            external_imports=_esc(ext_text),
+            imported_by=_esc(iby_text),
+        )
+        try:
+            results[dir_name] = _call_llm(prompt, provider, api_key, model, max_tokens)
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            results[dir_name] = (
+                f"*C4Component generation failed for {dir_name}: {err_msg}*"
+            )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +829,17 @@ def generate_guide(
     provider: str,
     api_key: str,
     model: Optional[str] = None,
-    max_tokens: int = 1500,
+    max_tokens: int = 2500,
     max_modules: int = 50,
     console=None,
 ) -> OnboardingGuide:
     """Run the full LLM narrative generation pipeline."""
+    from onboard.stages.tech_detector import detect_tech_context
+    from onboard.stages.tech_detector import TechContext
 
     defaults = PROVIDER_DEFAULTS.get(provider, {})
     model = model or defaults.get("model", "")
+    max_tokens = max_tokens or defaults.get("max_tokens", 2500)
 
     def log(msg: str):
         if console:
@@ -436,11 +860,7 @@ def generate_guide(
     log(f"Generating narratives for {len(modules_to_process)} modules "
         f"({_LLM_MAX_CONCURRENT} concurrent)...")
 
-    # ---- Concurrent module narrative generation ----------------------------
-    # Each _generate_module call is independent (read-only graph/history/corpus).
-    # A bounded thread pool caps concurrent API requests to avoid rate limits.
-    # Results are collected in arrival order and re-sorted to reading order.
-
+    # ---- Concurrent module narrative generation --------------------------------
     raw_results: dict[str, ModuleNarrative] = {}
     done_count = 0
 
@@ -449,12 +869,16 @@ def generate_guide(
             executor.submit(
                 _generate_module,
                 path, graph, history, corpus,
-                provider, api_key, model, max_tokens,
+                provider, api_key, model, max_tokens, repo_path,
             ): path
             for path in modules_to_process
         }
         for future in as_completed(future_map):
-            path, narrative, err_logged = future.result()
+            try:
+                path, narrative, err_logged = future.result()
+            except Exception as exc:
+                log(f"  [error] unexpected thread error: {exc}")
+                continue
             done_count += 1
             log(f"  [{done_count}/{len(modules_to_process)}] {path}")
             if err_logged:
@@ -467,7 +891,16 @@ def generate_guide(
             raw_results[path].reading_order_index = idx
             guide.modules[path] = raw_results[path]
 
-    # ---- System overview ---------------------------------------------------
+    # ---- Tech context (static, no LLM) ----------------------------------------
+    log("Detecting technology context...")
+    try:
+        tech = detect_tech_context(graph)
+        log(f"  {tech.summary()}")
+    except Exception as e:
+        log(f"  [warning] tech detection failed: {e}")
+        tech = TechContext()
+
+    # ---- System overview -------------------------------------------------------
     log("Generating system overview...")
 
     from onboard.stages.static_analysis import summarize_graph
@@ -485,8 +918,6 @@ def generate_guide(
     arch_docs = corpus.arch_docs()
     arch_text = "\n".join(f.content[:300] for f in arch_docs[:3]) or "None found."
 
-    # _esc() applied to all user content — arch docs and commit themes can
-    # contain { } characters that would crash OVERVIEW_PROMPT.format().
     overview_prompt = OVERVIEW_PROMPT.format(
         total_files=summary["total_files"],
         languages=_esc(str(summary["languages"])),
@@ -506,7 +937,40 @@ def generate_guide(
         guide.system_overview = f"*Overview generation failed: {err_msg}*"
         log(f"  [warning] overview: {err_msg}")
 
-    # ---- Guided tour -------------------------------------------------------
+    # Extract C4 context diagram from overview if present
+    guide.c4_context_mermaid = _extract_mermaid(guide.system_overview, "C4Context")
+
+    # ---- Arc42 architecture document ------------------------------------------
+    log("Generating Arc42 architecture document...")
+    arc42_text = _generate_arc42(
+        graph, history, corpus, tech, modules_to_process[:20],
+        provider, api_key, model, max_tokens,
+    )
+    guide.arc42 = arc42_text
+    guide.c4_context_mermaid = (
+        guide.c4_context_mermaid or _extract_mermaid(arc42_text, "C4Context")
+    )
+    guide.c4_container_mermaid = _extract_mermaid(arc42_text, "C4Container")
+
+    # ---- Domain model ---------------------------------------------------------
+    log("Generating domain model...")
+    guide.domain_model_mermaid = _generate_domain_model(
+        graph, tech, provider, api_key, model, max_tokens,
+    )
+
+    # ---- Data flow diagram ----------------------------------------------------
+    log("Generating data flow diagram...")
+    guide.data_flow_mermaid = _generate_dfd(
+        graph, tech, provider, api_key, model, max_tokens,
+    )
+
+    # ---- C4 component diagrams (one per top-level directory) ------------------
+    log("Generating C4 component diagrams...")
+    guide.dir_c4_components = _generate_c4_components(
+        graph, provider, api_key, model, max_tokens,
+    )
+
+    # ---- Guided tour ----------------------------------------------------------
     guide.guided_tour = _build_guided_tour(guide, graph, history)
 
     return guide
@@ -533,11 +997,10 @@ def _build_guided_tour(
         if mod is None:
             continue
 
-        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", path)
+        slug = re.sub(r"[^\w\-]", "_", path)
         lines.append(f"## Step {idx + 1}: [{mod.title}](modules/{slug}.md)\n")
 
         if mod.summary:
-            # First paragraph of summary only
             first_para = mod.summary.split("\n\n")[0].strip()
             lines.append(first_para + "\n")
 

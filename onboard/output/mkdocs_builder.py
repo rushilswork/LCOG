@@ -108,9 +108,105 @@ def _hotspot_table(guide: OnboardingGuide, top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+# ── Architecture diagram (package-level) ─────────────────────────────────────
+
+def _build_arch_diagram(graph: nx.DiGraph) -> str:
+    """Mermaid graph showing inter-package dependencies — package-level view."""
+    pkg_edges: set[tuple[str, str]] = set()
+    pkg_counts: Counter = Counter()
+    for node in graph.nodes():
+        top = Path(node).parts[0] if len(Path(node).parts) > 1 else "_root_"
+        pkg_counts[top] += 1
+    for src, dst in graph.edges():
+        sp = Path(src).parts[0] if len(Path(src).parts) > 1 else "_root_"
+        dp = Path(dst).parts[0] if len(Path(dst).parts) > 1 else "_root_"
+        if sp != dp:
+            pkg_edges.add((sp, dp))
+    if not pkg_edges and len(pkg_counts) <= 1:
+        return ""
+    lines = [
+        "```mermaid",
+        '%%{init: {"flowchart": {"rankSpacing": 60, "nodeSpacing": 50}}}%%',
+        "graph TD",
+    ]
+    for pkg, count in sorted(pkg_counts.items()):
+        slug = _slugify(pkg)
+        label = f"{pkg}/ ({count} files)".replace('"', "'")
+        lines.append(f'    {slug}["{label}"]')
+    for sp, dp in sorted(pkg_edges):
+        lines.append(f"    {_slugify(sp)} --> {_slugify(dp)}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ── Per-module local dependency graph ─────────────────────────────────────────
+
+def _build_local_graph(path: str, graph: nx.DiGraph) -> str:
+    """Mermaid graph: this file + its direct importers and imports."""
+    preds = list(graph.predecessors(path))[:8]
+    succs = list(graph.successors(path))[:8]
+    if not preds and not succs:
+        return ""
+    lines = [
+        "```mermaid",
+        '%%{init: {"flowchart": {"rankSpacing": 50, "nodeSpacing": 30}}}%%',
+        "graph LR",
+    ]
+    this_slug = _slugify(path)
+    this_label = _node_label(path).replace('"', "'")
+    lines.append(f'    {this_slug}["{this_label}"]:::current')
+    for p in preds:
+        slug = _slugify(p)
+        label = _node_label(p).replace('"', "'")
+        lines.append(f'    {slug}["{label}"] --> {this_slug}')
+    for s in succs:
+        slug = _slugify(s)
+        label = _node_label(s).replace('"', "'")
+        lines.append(f'    {this_slug} --> {slug}["{label}"]')
+    lines.append("    classDef current fill:#f9a,stroke:#c55,stroke-width:2px;")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ── Per-module class/structure diagram ────────────────────────────────────────
+
+def _build_class_diagram(path: str, graph: nx.DiGraph) -> str:
+    """Mermaid classDiagram built from tree-sitter Symbol data — no AI needed."""
+    symbols = graph.nodes.get(path, {}).get("symbols", [])
+    if not symbols:
+        return ""
+    classes = [s for s in symbols if s.kind == "class"]
+    functions = [s for s in symbols if s.kind == "function"]
+    if not classes and not functions:
+        return ""
+    lines = ["```mermaid", "classDiagram"]
+    if classes:
+        for cls in classes:
+            methods = [s for s in functions
+                       if cls.start_line <= s.start_line <= cls.end_line]
+            safe = re.sub(r"[^\w]", "_", cls.name)
+            lines.append(f"  class {safe} {{")
+            for m in methods[:12]:
+                lines.append(f"    +{m.name}()")
+            if len(methods) > 12:
+                lines.append(f"    ... {len(methods)-12} more")
+            lines.append("  }")
+    else:
+        mod_name = re.sub(r"[^\w]", "_", Path(path).stem)
+        lines.append(f"  class {mod_name} {{")
+        for f in functions[:15]:
+            lines.append(f"    +{f.name}()")
+        if len(functions) > 15:
+            lines.append(f"    ... {len(functions)-15} more")
+        lines.append("  }")
+    lines.append("```")
+    return "\n".join(lines)
+
+
 # ── Index page ────────────────────────────────────────────────────────────────
 
 def _build_index(guide: OnboardingGuide, graph: nx.DiGraph) -> str:
+    arch = _build_arch_diagram(graph)
     mermaid = _mermaid_graph(graph)
     hotspots = _hotspot_table(guide)
     themes = ""
@@ -122,12 +218,22 @@ def _build_index(guide: OnboardingGuide, graph: nx.DiGraph) -> str:
         f"{i+1}. [`{p}`](modules/{_slugify(p)}.md)"
         for i, p in enumerate(guide.reading_order[:20])
     )
+    arch_section = f"\n## Package Architecture\n\n{arch}\n\n---\n\n" if arch else ""
+    c4_section = (
+        f"\n## System Context\n\n{guide.c4_context_mermaid}\n\n---\n\n"
+        if guide.c4_context_mermaid else ""
+    )
     return (
         "# System Overview\n\n"
         + guide.system_overview + "\n\n---\n\n"
+        + c4_section
+        + arch_section
         + themes + "\n\n## Dependency Graph\n\n"
         + "[Open interactive graph](graph.html){ .md-button }\n\n"
         + "[Browse file tree](file_tree.md){ .md-button }\n\n"
+        + "[Architecture (Arc42)](arc42.md){ .md-button }\n\n"
+        + "[Domain Model](domain_model.md){ .md-button }\n\n"
+        + "[Data Flow](data_flow.md){ .md-button }\n\n"
         + mermaid + "\n\n---\n\n## Suggested Reading Order\n\n"
         + reading_list + "\n\n---\n\n"
         + hotspots + "\n"
@@ -136,7 +242,7 @@ def _build_index(guide: OnboardingGuide, graph: nx.DiGraph) -> str:
 
 # ── Module page ───────────────────────────────────────────────────────────────
 
-def _build_module_page(mod: ModuleNarrative) -> str:
+def _build_module_page(mod: ModuleNarrative, graph: nx.DiGraph) -> str:
     sections = [f"# {mod.title}\n\n**File:** `{mod.path}`\n"]
     if mod.dead_code_warning:
         sections.append(f"\n{mod.dead_code_warning}\n")
@@ -145,10 +251,30 @@ def _build_module_page(mod: ModuleNarrative) -> str:
     sections.append(f"\n## What this module does\n\n{mod.summary}\n")
     if mod.walkthrough:
         sections.append(f"\n## How it fits into the system\n\n{mod.walkthrough}\n")
+    if mod.architecture_notes:
+        sections.append(f"\n## Architecture notes\n\n{mod.architecture_notes}\n")
+    local_graph = _build_local_graph(mod.path, graph)
+    if local_graph:
+        sections.append(f"\n## Dependencies\n\n{local_graph}\n")
+    class_diagram = _build_class_diagram(mod.path, graph)
+    if class_diagram:
+        sections.append(f"\n## Structure\n\n{class_diagram}\n")
+    if mod.entry_points_usage:
+        sections.append(f"\n## How to use this module\n\n{mod.entry_points_usage}\n")
+    if mod.code_walkthrough:
+        sections.append(f"\n## Code walkthrough\n\n{mod.code_walkthrough}\n")
     if mod.design_notes:
         sections.append(f"\n## Key design decisions\n\n{mod.design_notes}\n")
+    if mod.patterns:
+        sections.append(f"\n## Patterns to follow\n\n{mod.patterns}\n")
     if mod.pitfalls:
         sections.append(f"\n## Pitfalls to avoid\n\n{mod.pitfalls}\n")
+    if mod.sequence_diagram:
+        sections.append(f"\n## Sequence diagram\n\n{mod.sequence_diagram}\n")
+    if mod.state_machine_diagram:
+        sections.append(f"\n## State machine\n\n{mod.state_machine_diagram}\n")
+    if mod.data_flow_snippet:
+        sections.append(f"\n## Data flow\n\n{mod.data_flow_snippet}\n")
     return "".join(sections)
 
 
@@ -226,7 +352,8 @@ def _build_file_tree_page(guide: OnboardingGuide, graph: nx.DiGraph) -> str:
 
 # ── Directory overview page ───────────────────────────────────────────────────
 
-def _build_directory_page(dir_name: str, modules: list, graph: nx.DiGraph) -> str:
+def _build_directory_page(dir_name: str, modules: list, graph: nx.DiGraph,
+                          c4_component: str = "") -> str:
     """Overview page for one top-level directory."""
     all_files = [
         n for n in graph.nodes()
@@ -237,6 +364,8 @@ def _build_directory_page(dir_name: str, modules: list, graph: nx.DiGraph) -> st
     display = dir_name if dir_name != "_root_" else "(root)"
 
     lines = [f"# {display}/\n"]
+    if c4_component and not c4_component.startswith("*C4Component"):
+        lines.append(f"\n## Component diagram\n\n{c4_component}\n")
     stats = f"**{len(all_files):,} files** · **{len(modules)} narrated**"
     if hotspot_mods:
         s = "s" if len(hotspot_mods) > 1 else ""
@@ -260,6 +389,30 @@ def _build_directory_page(dir_name: str, modules: list, graph: nx.DiGraph) -> st
             lines.append(f"| [{title}](../modules/{slug}.md) | {summary} | {flags} |")
 
     return "\n".join(lines) + "\n"
+
+
+# ── Arc42 page ────────────────────────────────────────────────────────────────
+
+def _build_arc42_page(guide: OnboardingGuide) -> str:
+    if not guide.arc42 or guide.arc42.startswith("*Arc42"):
+        return "# Architecture (Arc42)\n\n*Run with AI enabled to generate the full Arc42 document.*\n"
+    return "# Architecture (Arc42)\n\n" + guide.arc42 + "\n"
+
+
+# ── Domain model page ─────────────────────────────────────────────────────────
+
+def _build_domain_model_page(guide: OnboardingGuide) -> str:
+    if not guide.domain_model_mermaid or guide.domain_model_mermaid.startswith("*Domain model"):
+        return "# Domain Model\n\n*Run with AI enabled to generate the domain model.*\n"
+    return "# Domain Model\n\n" + guide.domain_model_mermaid + "\n"
+
+
+# ── Data flow page ────────────────────────────────────────────────────────────
+
+def _build_data_flow_page(guide: OnboardingGuide) -> str:
+    if not guide.data_flow_mermaid or guide.data_flow_mermaid.startswith("*Data flow"):
+        return "# Data Flow\n\n*Run with AI enabled to generate the data flow diagram.*\n"
+    return "# Data Flow\n\n" + guide.data_flow_mermaid + "\n"
 
 
 # ── Interactive vis.js graph ──────────────────────────────────────────────────
@@ -578,6 +731,9 @@ def _build_mkdocs_yml(site_name: str, module_paths: list,
     nav_list: list = [
         {"Home": "index.md"},
         {"Guided Tour": "guided_tour.md"},
+        {"Architecture (Arc42)": "arc42.md"},
+        {"Domain Model": "domain_model.md"},
+        {"Data Flow": "data_flow.md"},
         {"File Tree": "file_tree.md"},
     ]
     if dir_page_names:
@@ -646,11 +802,14 @@ def build_site(guide: OnboardingGuide, graph: nx.DiGraph,
     (docs_dir / "index.md").write_text(_build_index(guide, graph), encoding="utf-8")
     (docs_dir / "guided_tour.md").write_text(guide.guided_tour, encoding="utf-8")
     (docs_dir / "file_tree.md").write_text(_build_file_tree_page(guide, graph), encoding="utf-8")
+    (docs_dir / "arc42.md").write_text(_build_arc42_page(guide), encoding="utf-8")
+    (docs_dir / "domain_model.md").write_text(_build_domain_model_page(guide), encoding="utf-8")
+    (docs_dir / "data_flow.md").write_text(_build_data_flow_page(guide), encoding="utf-8")
 
     # Per-module pages
     for path, mod in guide.modules.items():
         slug = _slugify(path)
-        (modules_dir / f"{slug}.md").write_text(_build_module_page(mod), encoding="utf-8")
+        (modules_dir / f"{slug}.md").write_text(_build_module_page(mod, graph), encoding="utf-8")
 
     # Per-directory overview pages
     dir_modules: dict[str, list] = defaultdict(list)
@@ -661,7 +820,8 @@ def build_site(guide: OnboardingGuide, graph: nx.DiGraph,
     dir_page_names: list[str] = []
     for dir_name, mods in sorted(dir_modules.items()):
         slug = _slugify(dir_name)
-        content = _build_directory_page(dir_name, mods, graph)
+        c4_comp = guide.dir_c4_components.get(dir_name, "")
+        content = _build_directory_page(dir_name, mods, graph, c4_comp)
         (dirs_dir / f"{slug}.md").write_text(content, encoding="utf-8")
         dir_page_names.append(dir_name)
 

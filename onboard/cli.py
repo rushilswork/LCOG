@@ -233,6 +233,13 @@ def analyze(
                 walkthrough="",
                 design_notes="",
                 pitfalls="",
+                patterns="",
+                architecture_notes="",
+                entry_points_usage="",
+                code_walkthrough="",
+                sequence_diagram="",
+                state_machine_diagram="",
+                data_flow_snippet="",
             )
         guide.guided_tour = "# Guided Tour\n\n*Run without --skip-llm to generate a full tour.*\n"
     else:
@@ -280,7 +287,6 @@ def analyze(
                 "[red]Error:[/red] mkdocs not found. "
                 "Run: pip install mkdocs-material"
             )
-
 
 @main.command()
 @click.argument("guide_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),

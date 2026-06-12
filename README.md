@@ -6,26 +6,28 @@ A CLI tool that analyses a git repository and generates a searchable MkDocs site
 
 ## What it does
 
-Most codebases have no onboarding docs. The ones that do have them scattered across READMEs, wikis, and tribal knowledge. This tool pulls everything together: the code structure, the git history, the existing comments, and (optionally) uses an LLM to write a walkthrough for each module.
+Most codebases have no onboarding docs. The ones that do have them scattered across READMEs, wikis, and tribal knowledge. This tool pulls everything together: the code structure, the git history, the existing comments, and uses an LLM to write a walkthrough for each module.
 
 The output is a static site with:
 
-- An interactive dependency graph — zoom, pan, drag, click to open any module page; nodes colour-coded by top-level directory with a live legend and directory filter
-- A static Mermaid dependency graph with clickable nodes
-- A file tree page — every parsed source file listed by directory, with hotspot 🔥 and dead code 💀 badges, narrated files linked directly to their module page
-- A directory overview page per top-level package — file counts, module table, aggregate hotspot/dead-code stats
-- A suggested reading order — dependencies first, hotspots surfaced early
-- A per-module page: what it does, how it fits, design decisions, pitfalls
-- Dead code callouts (files untouched for 2+ years)
-- Hotspot warnings (files that change constantly — add tests before touching)
-- A guided tour that walks through the whole codebase in sequence
-- Full-text search
+- **System overview** — AI-generated narrative explaining the entire system
+- **Arc42 architecture document** — full 12-section architecture spec (Introduction, Constraints, Context, Solution Strategy, Building Blocks, Runtime View, Deployment, Cross-cutting Concepts, Decisions, Quality Requirements, Risks, Glossary)
+- **C4 diagrams** — Level 1 Context, Level 2 Container, and Level 3 Component diagrams (Mermaid-rendered, no plugins needed)
+- **Domain model** — ER diagram of your entities and their relationships
+- **Data flow diagram** — DFD showing how data moves through the system
+- **Per-module pages** — 11 sections each: summary, architecture notes, dependencies (local graph), structure (class diagram), how to use, code walkthrough, key design decisions, patterns to follow, pitfalls, sequence diagram, state machine diagram, data flow snippet
+- **Interactive dependency graph** — zoom, pan, drag, click to open any module page; nodes colour-coded by top-level directory with a live legend and directory filter
+- **Static Mermaid dependency graph** — clickable nodes in the index page
+- **Directory overview pages** — one per top-level package, with C4 Component diagram, file counts, module table, hotspot/dead code stats
+- **File tree page** — every parsed source file listed by directory, with hotspot 🔥 and dead code 💀 badges, narrated files linked to their module page
+- **Guided tour** — AI-narrated walkthrough of the whole codebase in reading order
+- **Full-text search**
 
 ---
 
 ## How it works
 
-Stages 1–3 run **in parallel** (they are fully independent). Stage 4 starts once all three finish. Each stage shows its own elapsed time as it completes, and the parallel wall-clock total is printed at the end.
+Stages 1–3 run **in parallel** (fully independent). Stage 4 starts once all three finish.
 
 **Stage 1 — Static analysis**
 Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, TSX, C/C++, and Java. Files are parsed in parallel using a thread pool (tree-sitter releases the GIL, so threads run on real cores). Builds a directed dependency graph. Files larger than 500 KB and standard noise directories (`node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.) are skipped automatically.
@@ -37,7 +39,19 @@ Reads the entire git log in a single subprocess call (`git log --name-only`), th
 Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the files they describe. Source file processing runs in parallel. Restricts prose collection to `.md` and `.rst` to avoid false positives.
 
 **Stage 4 — LLM narratives** *(skipped with --skip-llm)*
-Sends each module's structure + history + docs to an LLM. Runs up to 3 concurrent API requests with per-request exponential backoff + jitter on rate limits. Produces a walkthrough covering what the module does, how it connects to the rest of the system, key design decisions, patterns to follow, and what to watch out for.
+Sends each module's structure + history + docs to an LLM and generates rich per-module content. Also runs five additional generation passes:
+
+1. **Per-module narratives** — summary, architecture notes, code walkthrough, how-to-use guide, key design decisions, patterns, pitfalls, plus conditional sequence/state/data-flow diagrams for complex modules
+2. **System overview** — high-level narrative covering the whole codebase
+3. **Arc42 document** — 12-section architecture spec; C4 Context and Container diagrams are extracted from it automatically
+4. **Domain model** — ER diagram of entities and relationships
+5. **Data flow diagram** — DFD showing data movement through the system
+6. **C4 Component diagrams** — one per top-level directory, showing internal components and their interactions
+
+All six generation passes run concurrently (up to 3 LLM requests in flight at once) with per-request exponential backoff + jitter on rate limits. Any single failed LLM call produces a stub — the guide always completes.
+
+**Tech detector (zero LLM, always runs)**
+Before any AI calls, a static scan identifies frameworks (Flask, FastAPI, Django, etc.) and external systems (PostgreSQL, Redis, AWS, Kafka, etc.) directly from import statements. This grounds every AI prompt with real signal, reducing hallucination in diagrams.
 
 ### Performance on large codebases
 
@@ -81,7 +95,7 @@ You only need bindings for languages actually present in the target repo. Missin
 
 ### Without AI (no API key needed)
 
-Stages 1–3 run in parallel. You get the full interactive dependency graph, static Mermaid graph, file tree, directory overviews, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages show stubs instead of LLM prose.
+Stages 1–3 run in parallel. You get the full interactive dependency graph, static Mermaid graph, file tree, directory overviews, reading order, hotspot and dead code flags, and all extracted docs. Module narrative pages and architecture documents show stubs.
 
 ```bash
 onboard analyze /path/to/repo --skip-llm
@@ -105,7 +119,7 @@ Both commands open `http://127.0.0.1:8000` in your browser automatically after a
 
 ### With AI (full output)
 
-All four stages run. The LLM writes actual narratives for every module, a system overview, and a guided tour.
+All four stages run. The LLM writes module narratives, a system overview, guided tour, Arc42 architecture document, domain model, data flow diagram, and C4 diagrams at all three levels.
 
 **Option 1: Groq** (default — fast, free tier available, no card required)
 
@@ -174,19 +188,62 @@ onboard analyze <repo_path> [OPTIONS]
 <repo>/onboarding-guide/
   mkdocs.yml
   docs/
-    index.md           ← system overview, Mermaid graph, reading order
+    index.md           ← system overview, C4 context diagram, Mermaid graph, reading order
     guided_tour.md     ← LLM-narrated walkthrough of the whole codebase
     file_tree.md       ← every parsed file, grouped by directory, with badges
+    arc42.md           ← full 12-section Arc42 architecture document
+    domain_model.md    ← ER diagram of entities and relationships
+    data_flow.md       ← data flow diagram (DFD)
     graph.html         ← interactive vis.js dependency graph
     dirs/
-      <dir>.md         ← one overview page per top-level package
+      <dir>.md         ← one overview page per top-level package (with C4 Component diagram)
     modules/
-      <slug>.md        ← per-module page: summary, walkthrough, design notes
+      <slug>.md        ← per-module page: 11 sections including code walkthrough + diagrams
     css/
       extra.css
 ```
 
-The MkDocs nav groups modules under their top-level directory automatically. On repos where all modules live in a single directory the nav stays flat.
+The MkDocs nav groups modules under their top-level directory automatically. Arc42, Domain Model, and Data Flow appear as top-level nav items under an "Architecture" section.
+
+---
+
+## Per-module pages (with AI)
+
+Each module page contains 11 sections:
+
+1. **What it does** — one-paragraph summary
+2. **How it fits** — where this module sits in the overall architecture
+3. **Architecture notes** — patterns used, layer responsibilities, design rationale
+4. **Dependencies** — local Mermaid graph showing direct importers and imports, with this file highlighted
+5. **Structure** — Mermaid class diagram built from tree-sitter symbols (no AI needed)
+6. **How to use** — entry points, typical call patterns, code examples
+7. **Code walkthrough** — section-by-section tour of the actual source
+8. **Key design decisions** — why things are the way they are
+9. **Patterns to follow** — conventions to preserve when modifying this file
+10. **Pitfalls** — what breaks, what's fragile, what surprised past contributors
+11. **Sequence / State machine / Data flow diagrams** — AI-generated Mermaid diagrams for complex modules (hotspots, modules with many symbols, managers, handlers, pipelines)
+
+Sections 11 diagrams only appear for modules that meet a complexity threshold: hotspot (>20 commits), high symbol count (>8), or name hints (`manager`, `handler`, `pipeline`, `service`, `processor`, `router`, `dispatcher`).
+
+---
+
+## Architecture pages (with AI)
+
+### Arc42 (`arc42.md`)
+A full 12-section architecture document covering: Introduction & Goals, Constraints, Context & Scope (with C4 Context diagram), Solution Strategy, Building Block View (with C4 Container diagram), Runtime View (with sequence diagrams), Deployment View, Cross-cutting Concepts, Architecture Decisions, Quality Requirements, Risks & Technical Debt, Glossary.
+
+### Domain Model (`domain_model.md`)
+An ER diagram showing entities, their attributes, and relationships across the codebase — inferred from class names, ORM models, and data structures detected statically and refined by the LLM.
+
+### Data Flow (`data_flow.md`)
+A DFD-style flowchart showing how data enters the system, is processed, stored, and returned — grounded in the statically detected external systems (databases, queues, APIs, cloud services).
+
+### C4 diagrams
+- **Level 1 — Context** (`index.md`): the system in relation to users and external systems
+- **Level 2 — Container** (`arc42.md`, Building Block View section): major containers and their relationships
+- **Level 3 — Component** (each `dirs/<dir>.md`): internal components within each top-level package
+
+All C4 diagrams use Mermaid's native `C4Context`, `C4Container`, and `C4Component` diagram types, which render in MkDocs Material without any additional plugins.
 
 ---
 
@@ -220,6 +277,8 @@ Click any node to open that module's page.
 - The `onboarding-guide` output directory is excluded from analysis, so running the tool on its own repo won't recurse.
 - Repos with no git history, bare repos, or repos on machines without git installed all run fine — Stage 2 degrades gracefully and returns empty history.
 - The interactive graph requires an internet connection to load vis.js from the unpkg CDN. All other pages are fully offline once generated.
+- C4 and Mermaid diagrams render using MkDocs Material's built-in Mermaid support — no extra plugins needed.
+- The tech detector runs even with `--skip-llm` (it is pure static analysis) and its output is printed in the Stage 1 summary.
 
 ---
 
@@ -235,8 +294,12 @@ Click any node to open that module's page.
 
 **Module pages show stubs** — you ran with `--skip-llm`. Re-run without the flag and with a valid API key to get full narratives.
 
+**Arc42 / domain model / data flow pages show stubs** — same as above; these are LLM-generated. Re-run without `--skip-llm`.
+
 **Windows encoding errors in terminal** — set `PYTHONUTF8=1` before running: `set PYTHONUTF8=1 && onboard analyze ...`
 
 **Stage 1 seems slow on first run** — tree-sitter compiles language grammars on first use and caches them. Subsequent runs are faster.
 
 **Graph shows fewer nodes than expected** — the interactive graph caps at 200 nodes (top by connectivity). All files appear in the File Tree page regardless of the cap.
+
+**C4 diagrams not rendering** — make sure you are using `mkdocs-material` (not plain `mkdocs`). Run `pip install mkdocs-material` and check that `mkdocs.yml` has `markdown_extensions: [pymdownx.superfences]` — the builder adds this automatically.
