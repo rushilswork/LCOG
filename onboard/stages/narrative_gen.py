@@ -423,7 +423,7 @@ def generate_guide(
             slug = _re.sub(r"[^\w\-]", "_", path)
             tour_parts.append(
                 f"\n## Step {idx + 1}: `{path}`\n\n{mod.summary}\n\n"
-                f"-> [Full walkthrough](modules/{slug}/)\n"
+                f"-> [Full walkthrough](modules/{slug}.md)\n"
             )
     guide.guided_tour = "\n".join(tour_parts)
 

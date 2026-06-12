@@ -46,7 +46,7 @@ def _mermaid_graph(graph: nx.DiGraph, max_nodes: int = 30) -> str:
     lines.append("    classDef entry fill:#f9a,stroke:#c55,stroke-width:2px;")
     for node in sub.nodes():
         slug = _slugify(node)
-        lines.append(f'    click {slug} "modules/{slug}/"')
+        lines.append(f'    click {slug} "modules/{slug}.md"')
     lines.append("```")
     return "\n".join(lines)
 
@@ -73,7 +73,7 @@ def _build_index(guide: OnboardingGuide, graph: nx.DiGraph) -> str:
             f"`{t}`" for t in guide.major_themes[:8]
         )
     reading_list = "\n".join(
-        f"{i+1}. [`{p}`](modules/{_slugify(p)}/)"
+        f"{i+1}. [`{p}`](modules/{_slugify(p)}.md)"
         for i, p in enumerate(guide.reading_order[:20])
     )
     return (
