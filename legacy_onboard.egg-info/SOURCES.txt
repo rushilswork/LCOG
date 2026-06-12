@@ -1,0 +1,17 @@
+pyproject.toml
+legacy_onboard.egg-info/PKG-INFO
+legacy_onboard.egg-info/SOURCES.txt
+legacy_onboard.egg-info/dependency_links.txt
+legacy_onboard.egg-info/entry_points.txt
+legacy_onboard.egg-info/requires.txt
+legacy_onboard.egg-info/top_level.txt
+onboard/__init__.py
+onboard/cli.py
+onboard/output/__init__.py
+onboard/output/mkdocs_builder.py
+onboard/stages/__init__.py
+onboard/stages/doc_collector.py
+onboard/stages/git_analysis.py
+onboard/stages/narrative_gen.py
+onboard/stages/static_analysis.py
+onboard/utils/__init__.py
