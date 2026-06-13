@@ -42,7 +42,7 @@ Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments
 Immediately after stages 1–3 finish, the tool writes a full skeleton site with stub pages for every module. If `--serve` is passed, `mkdocs serve` starts and the browser opens at this point — you don't wait for the LLM. As Stage 4 completes each module narrative, the corresponding `.md` file is overwritten in-place and mkdocs serve's file watcher picks it up automatically (live refresh).
 
 **Stage 4 — LLM narratives** *(skipped with --skip-llm)*
-Sends each module's structure + history + docs to an LLM and generates rich per-module content. Also runs five additional generation passes (all five run in parallel at the end):
+Sends each module's structure + history + docs to an LLM and generates rich per-module content. Results are cached in `.onboard_cache/narrative_cache.pkl` — on a second run against an unchanged repo, all cached modules are served instantly (zero LLM calls). Also runs five additional generation passes (all five run in parallel at the end):
 
 1. **Per-module narratives** — summary, architecture notes, code walkthrough, how-to-use guide, key design decisions, patterns, pitfalls, plus conditional sequence/state/data-flow diagrams for complex modules. Up to 8 modules generated concurrently. Trivial modules (fewer than 3 symbols, no dependants, no git history) are skipped — typically 30–40% of files in large repos.
 2. **System overview** — high-level narrative covering the whole codebase
@@ -67,7 +67,8 @@ Before any AI calls, a static scan identifies frameworks (Flask, FastAPI, Django
 | Stages 1–3 combined (parallel) | ~200s | ~8s cold / ~3s warm |
 | **Skeleton site ready** | after stage 4 | **after stage 3** |
 | Stage 4 (50 modules, 8b-instant) | ~150s (3 concurrent) | ~40s (8 concurrent + trivial skip) |
-| **Total (with LLM)** | **~6 min** | **~50s** |
+| **Total (with LLM, first run)** | **~6 min** | **~50s** |
+| **Total (with LLM, second run — unchanged repo)** | — | **~10s** (parse cache + narrative cache) |
 
 `--skip-llm` on a large monolith: cold ~8s, warm ~3s.
 
@@ -175,7 +176,7 @@ onboard analyze <repo_path> [OPTIONS]
   --serve                 Start mkdocs serve after skeleton build; browser opens immediately
   --workers INT           Parallel workers for file parsing  [default: auto]
   --retry-failed          Re-generate only modules whose narrative previously failed
-  --no-cache              Skip parse cache; re-parse all files from scratch
+  --no-cache              Bypass parse cache and narrative cache; full re-parse and re-generate
 ```
 
 `--workers` defaults to `min(8, cpu_count)`. Increase on machines with more cores; reduce if memory is limited on very large repos.
@@ -210,9 +211,15 @@ onboard analyze /path/to/repo --retry-failed
 
 This scans the existing `docs/modules/*.md` files for `"Narrative unavailable"` admonitions, extracts the affected file paths, and only re-runs the LLM for those modules. The rest of the guide is untouched.
 
-### Parse cache
+### Caching
 
-On the second run against an unchanged repo, Stage 1 skips tree-sitter parsing for every file whose path, modification time, and size match the cached result. The cache lives at `<repo>/.onboard_cache/parse_cache.pkl`. Pass `--no-cache` to force a full re-parse.
+Two independent caches live under `<repo>/.onboard_cache/`:
+
+**Parse cache** (`parse_cache.pkl`) — Stage 1 skips tree-sitter parsing for files whose path, mtime, and size match the cached result.
+
+**Narrative cache** (`narrative_cache.pkl`) — Stage 4 skips LLM calls for modules whose cache key matches. The key is a SHA256 hash of the file's content + all direct neighbors' content + the model name. If the file or any file it imports/exports to changes, that module's cache entry is invalidated and regenerated. Architecture docs (arc42, C4, domain model, data flow, overview) are cached separately, keyed on the full graph topology — any structural change (new file, new import edge) invalidates them. Failed arch docs are never cached, so a re-run retries them automatically.
+
+Pass `--no-cache` to bypass both caches entirely.
 
 ---
 
@@ -238,6 +245,7 @@ On the second run against an unchanged repo, Stage 1 skips tree-sitter parsing f
 
 <repo>/.onboard_cache/
   parse_cache.pkl      ← tree-sitter parse results (path + mtime + size keyed)
+  narrative_cache.pkl  ← LLM outputs (SHA256 of file + neighbors + model keyed)
 ```
 
 The MkDocs nav groups modules under their top-level directory automatically. Arc42, Domain Model, and Data Flow appear as top-level nav items under an "Architecture" section.
@@ -346,3 +354,7 @@ Click any node to navigate directly to that module's page.
 **C4 diagrams not rendering** — make sure you are using `mkdocs-material` (not plain `mkdocs`). Run `pip install mkdocs-material` and check that `mkdocs.yml` has `markdown_extensions: [pymdownx.superfences]` — the builder adds this automatically.
 
 **Node clicks in the graph give 404 errors** — this should not happen with current versions. If you have a guide generated by an older version, re-run `onboard analyze` to regenerate it with root-relative URLs.
+
+**Second run is still calling the LLM** — make sure `--no-cache` is not set. Also check that the source files haven't changed — any file whose content or direct neighbors changed gets a new cache key and is regenerated.
+
+**Arch docs regenerating every run** — the arch cache is keyed on graph topology (nodes + edges). If your repo has uncommitted changes or a file is being recreated on each run, the topology hash changes. Commit or stabilise the working tree, then re-run.

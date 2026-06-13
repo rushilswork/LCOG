@@ -415,6 +415,7 @@ def analyze(
                 console=console,
                 module_done_callback=_on_module_done,
                 only_paths=only_paths,
+                cache_dir=cache_dir,
             )
 
         console.print(f"  Modules narrated: [cyan]{len(guide.modules)}[/cyan]")

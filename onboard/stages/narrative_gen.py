@@ -19,6 +19,8 @@ Also produces:
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 import random
 import re
 import time
@@ -32,6 +34,10 @@ import networkx as nx
 from onboard.stages.doc_collector import DocCorpus
 from onboard.stages.git_analysis import FileHistory, RepoHistory
 from onboard.stages.static_analysis import Symbol
+
+# Bump this whenever prompt templates change — invalidates all cached narratives.
+_CACHE_VERSION = "v1"
+_NARRATIVE_CACHE_FILE = "narrative_cache.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +904,105 @@ def _build_overview_prompt(
 
 
 # ---------------------------------------------------------------------------
+# LLM Output Cache
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ModuleCacheEntry:
+    cache_key: str
+    narrative: "ModuleNarrative"
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class _ArchCacheEntry:
+    cache_key: str
+    system_overview: str
+    arc42: str
+    domain_model_mermaid: str
+    data_flow_mermaid: str
+    dir_c4_components: dict
+    c4_context_mermaid: str
+    c4_container_mermaid: str
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class _NarrativeCache:
+    modules: dict[str, _ModuleCacheEntry] = field(default_factory=dict)
+    arch: Optional[_ArchCacheEntry] = None
+
+
+def _load_narrative_cache(cache_dir: Path) -> _NarrativeCache:
+    path = cache_dir / _NARRATIVE_CACHE_FILE
+    try:
+        if path.exists():
+            with path.open("rb") as f:
+                obj = pickle.load(f)
+            if isinstance(obj, _NarrativeCache):
+                return obj
+    except Exception:
+        pass
+    return _NarrativeCache()
+
+
+def _save_narrative_cache(cache_dir: Path, cache: _NarrativeCache) -> None:
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / _NARRATIVE_CACHE_FILE
+        with path.open("wb") as f:
+            pickle.dump(cache, f)
+    except Exception:
+        pass  # cache write failure is non-fatal
+
+
+def _module_cache_key(
+    path: str,
+    repo_path: Path,
+    graph: nx.DiGraph,
+    model: str,
+) -> str:
+    """SHA256 over: own content + direct neighbors' content + model + cache version.
+
+    Neighbors = files this module imports (successors) + files that import this
+    module (predecessors). Both affect the LLM prompt context, so a change to
+    either invalidates the cached narrative.
+    """
+    h = hashlib.sha256()
+    # Own file content
+    try:
+        h.update((repo_path / path).read_bytes())
+    except OSError:
+        h.update(path.encode())
+    # All direct neighbors (both directions) — sorted for determinism
+    neighbors = sorted(set(graph.predecessors(path)) | set(graph.successors(path)))
+    for dep in neighbors:
+        try:
+            h.update((repo_path / dep).read_bytes())
+        except OSError:
+            h.update(dep.encode())
+    # Model + prompt version — different model or changed prompt = different output
+    h.update(f"|{model}|{_CACHE_VERSION}".encode())
+    return h.hexdigest()
+
+
+def _arch_cache_key(graph: nx.DiGraph, model: str) -> str:
+    """SHA256 over: full graph topology + model + cache version.
+
+    Arch docs (arc42, C4, domain model, data flow, overview) reflect the entire
+    codebase structure, so any topology change — added file, new import edge,
+    removed module — invalidates them.
+    """
+    h = hashlib.sha256()
+    for node in sorted(graph.nodes()):
+        h.update(node.encode())
+    for u, v in sorted(graph.edges()):
+        h.update(f"{u}\x00{v}".encode())
+    h.update(f"|{model}|{_CACHE_VERSION}".encode())
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -914,12 +1019,16 @@ def generate_guide(
     console=None,
     module_done_callback: Optional[Callable[[str, ModuleNarrative], None]] = None,
     only_paths: Optional[list[str]] = None,
+    cache_dir: Optional[Path] = None,
 ) -> OnboardingGuide:
     """Run the full LLM narrative generation pipeline.
 
     module_done_callback: called on the thread-pool thread each time a module
         narrative finishes — use to write progressive page updates.
     only_paths: if set, only narrate these specific paths (used by --retry-failed).
+    cache_dir: if set, load/save LLM output cache here. Cache keys are SHA256
+        hashes of file content + neighbors + model + prompt version, so the cache
+        is invalidated precisely when the underlying code or context changes.
     """
     from onboard.stages.tech_detector import detect_tech_context
     from onboard.stages.tech_detector import TechContext
@@ -949,6 +1058,10 @@ def generate_guide(
     else:
         modules_to_process = reading_order[:max_modules]
 
+    # ── Load LLM output cache ────────────────────────────────────────────
+    _cache: _NarrativeCache = _load_narrative_cache(cache_dir) if cache_dir else _NarrativeCache()
+    _cache_dirty = False
+
     log(f"Provider: {provider} | Model: {model}")
     log(f"Generating narratives for {len(modules_to_process)} modules "
         f"({_LLM_MAX_CONCURRENT} concurrent)...")
@@ -956,28 +1069,60 @@ def generate_guide(
     # ── Concurrent module narrative generation ────────────────────────────
     raw_results: dict[str, ModuleNarrative] = {}
     done_count = 0
+    cache_hits = 0
+
+    # Separate cached modules from those that need LLM calls.
+    # Precompute cache keys so they are not recalculated at store time.
+    needs_llm: list[tuple[str, Optional[str]]] = []  # (path, precomputed_key_or_None)
+    for path in modules_to_process:
+        if cache_dir:
+            ck = _module_cache_key(path, repo_path, graph, model)
+            entry = _cache.modules.get(path)
+            if entry is not None and entry.cache_key == ck:
+                raw_results[path] = entry.narrative
+                cache_hits += 1
+                # Fire progressive callback for cached result too
+                if module_done_callback:
+                    try:
+                        module_done_callback(path, entry.narrative)
+                    except Exception:
+                        pass
+                continue
+            needs_llm.append((path, ck))
+        else:
+            needs_llm.append((path, None))
+
+    if cache_hits:
+        log(f"  [cache] {cache_hits} module(s) served from cache, "
+            f"{len(needs_llm)} need LLM calls")
 
     _mod_exec = ThreadPoolExecutor(max_workers=_LLM_MAX_CONCURRENT)
     try:
+        # future_map: future → (path, precomputed_cache_key)
         future_map = {
             _mod_exec.submit(
                 _generate_module,
                 path, graph, history, corpus,
                 provider, api_key, model, max_tokens, repo_path,
-            ): path
-            for path in modules_to_process
+            ): (path, ck)
+            for path, ck in needs_llm
         }
         for future in as_completed(future_map):
+            path, ck = future_map[future]
             try:
-                path, narrative, err_logged = future.result()
+                _path, narrative, err_logged = future.result()
             except Exception as exc:
                 log(f"  [error] unexpected thread error: {exc}")
                 continue
             done_count += 1
-            log(f"  [{done_count}/{len(modules_to_process)}] {path}")
+            log(f"  [{done_count}/{len(needs_llm)}] {path}")
             if err_logged:
                 log(f"    [warning] {err_logged}")
             raw_results[path] = narrative
+            # Store in cache using the precomputed key — no second file read
+            if cache_dir and ck is not None:
+                _cache.modules[path] = _ModuleCacheEntry(cache_key=ck, narrative=narrative)
+                _cache_dirty = True
             # Progressive callback — fires as soon as each module is done
             if module_done_callback:
                 try:
@@ -986,11 +1131,20 @@ def generate_guide(
                     pass
         _mod_exec.shutdown(wait=True)
     except KeyboardInterrupt:
+        if _cache_dirty and cache_dir:
+            _save_narrative_cache(cache_dir, _cache)
         _mod_exec.shutdown(wait=False, cancel_futures=True)
         raise
     except Exception:
+        if _cache_dirty and cache_dir:
+            _save_narrative_cache(cache_dir, _cache)
         _mod_exec.shutdown(wait=False, cancel_futures=True)
         raise
+
+    # Persist cache after module generation completes
+    if _cache_dirty and cache_dir:
+        _save_narrative_cache(cache_dir, _cache)
+        _cache_dirty = False
 
     # Restore reading order and assign index
     for idx, path in enumerate(modules_to_process):
@@ -1007,83 +1161,122 @@ def generate_guide(
         log(f"  [warning] tech detection failed: {e}")
         tech = TechContext()
 
-    # ── Architecture docs — all 5 LLM calls run in parallel ──────────────
+    # ── Architecture docs — cache check then parallel generation ─────────
     log("Generating architecture documents (parallel)...")
     overview_prompt = _build_overview_prompt(graph, history, corpus, modules_to_process)
 
-    _arch_exec = ThreadPoolExecutor(max_workers=5)
-    try:
-        f_overview = _arch_exec.submit(
-            _call_llm, overview_prompt, provider, api_key, model, max_tokens
-        )
-        f_arc42 = _arch_exec.submit(
-            _generate_arc42,
-            graph, history, corpus, tech, modules_to_process[:20],
-            provider, api_key, model, max_tokens,
-        )
-        f_domain = _arch_exec.submit(
-            _generate_domain_model,
-            graph, tech, provider, api_key, model, max_tokens,
-        )
-        f_dfd = _arch_exec.submit(
-            _generate_dfd,
-            graph, tech, provider, api_key, model, max_tokens,
-        )
-        f_c4 = _arch_exec.submit(
-            _generate_c4_components,
-            graph, provider, api_key, model, max_tokens,
-        )
+    arch_key = _arch_cache_key(graph, model) if cache_dir else None
+    arch_entry = _cache.arch if (arch_key and _cache.arch and _cache.arch.cache_key == arch_key) else None
 
-        # Collect results (order matters for C4 extraction)
+    if arch_entry:
+        log("  [cache] architecture docs served from cache")
+        guide.system_overview    = arch_entry.system_overview
+        guide.arc42              = arch_entry.arc42
+        guide.domain_model_mermaid = arch_entry.domain_model_mermaid
+        guide.data_flow_mermaid  = arch_entry.data_flow_mermaid
+        guide.dir_c4_components  = arch_entry.dir_c4_components
+        guide.c4_context_mermaid = arch_entry.c4_context_mermaid
+        guide.c4_container_mermaid = arch_entry.c4_container_mermaid
+    else:
+        _arch_exec = ThreadPoolExecutor(max_workers=5)
         try:
-            guide.system_overview = f_overview.result()
-        except Exception as e:
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            guide.system_overview = f"*Overview generation failed: {err_msg}*"
-            log(f"  [warning] overview: {err_msg}")
+            f_overview = _arch_exec.submit(
+                _call_llm, overview_prompt, provider, api_key, model, max_tokens
+            )
+            f_arc42 = _arch_exec.submit(
+                _generate_arc42,
+                graph, history, corpus, tech, modules_to_process[:20],
+                provider, api_key, model, max_tokens,
+            )
+            f_domain = _arch_exec.submit(
+                _generate_domain_model,
+                graph, tech, provider, api_key, model, max_tokens,
+            )
+            f_dfd = _arch_exec.submit(
+                _generate_dfd,
+                graph, tech, provider, api_key, model, max_tokens,
+            )
+            f_c4 = _arch_exec.submit(
+                _generate_c4_components,
+                graph, provider, api_key, model, max_tokens,
+            )
 
-        guide.c4_context_mermaid = _extract_mermaid(guide.system_overview, "C4Context")
+            # Collect results (order matters for C4 extraction).
+            # Track failures — only cache arch docs if ALL succeeded, so a
+            # transient error (429, timeout) doesn't get permanently cached.
+            _arch_any_failed = False
 
-        try:
-            arc42_text = f_arc42.result()
-        except Exception as e:
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            arc42_text = f"*Arc42 generation failed: {err_msg}*"
-            log(f"  [warning] arc42: {err_msg}")
-        guide.arc42 = arc42_text
-        guide.c4_context_mermaid = (
-            guide.c4_context_mermaid or _extract_mermaid(arc42_text, "C4Context")
-        )
-        guide.c4_container_mermaid = _extract_mermaid(arc42_text, "C4Container")
+            try:
+                guide.system_overview = f_overview.result()
+            except Exception as e:
+                err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+                guide.system_overview = f"*Overview generation failed: {err_msg}*"
+                log(f"  [warning] overview: {err_msg}")
+                _arch_any_failed = True
 
-        try:
-            guide.domain_model_mermaid = f_domain.result()
-        except Exception as e:
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            guide.domain_model_mermaid = f"*Domain model generation failed: {err_msg}*"
-            log(f"  [warning] domain model: {err_msg}")
+            guide.c4_context_mermaid = _extract_mermaid(guide.system_overview, "C4Context")
 
-        try:
-            guide.data_flow_mermaid = f_dfd.result()
-        except Exception as e:
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            guide.data_flow_mermaid = f"*Data flow generation failed: {err_msg}*"
-            log(f"  [warning] data flow: {err_msg}")
+            try:
+                arc42_text = f_arc42.result()
+            except Exception as e:
+                err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+                arc42_text = f"*Arc42 generation failed: {err_msg}*"
+                log(f"  [warning] arc42: {err_msg}")
+                _arch_any_failed = True
+            guide.arc42 = arc42_text
+            guide.c4_context_mermaid = (
+                guide.c4_context_mermaid or _extract_mermaid(arc42_text, "C4Context")
+            )
+            guide.c4_container_mermaid = _extract_mermaid(arc42_text, "C4Container")
 
-        try:
-            guide.dir_c4_components = f_c4.result()
-        except Exception as e:
-            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-            guide.dir_c4_components = {}
-            log(f"  [warning] C4 components: {err_msg}")
+            try:
+                guide.domain_model_mermaid = f_domain.result()
+            except Exception as e:
+                err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+                guide.domain_model_mermaid = f"*Domain model generation failed: {err_msg}*"
+                log(f"  [warning] domain model: {err_msg}")
+                _arch_any_failed = True
 
-        _arch_exec.shutdown(wait=True)
-    except KeyboardInterrupt:
-        _arch_exec.shutdown(wait=False, cancel_futures=True)
-        raise
-    except Exception:
-        _arch_exec.shutdown(wait=False, cancel_futures=True)
-        raise
+            try:
+                guide.data_flow_mermaid = f_dfd.result()
+            except Exception as e:
+                err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+                guide.data_flow_mermaid = f"*Data flow generation failed: {err_msg}*"
+                log(f"  [warning] data flow: {err_msg}")
+                _arch_any_failed = True
+
+            try:
+                guide.dir_c4_components = f_c4.result()
+            except Exception as e:
+                err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+                guide.dir_c4_components = {}
+                log(f"  [warning] C4 components: {err_msg}")
+                _arch_any_failed = True
+
+            _arch_exec.shutdown(wait=True)
+        except KeyboardInterrupt:
+            _arch_exec.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception:
+            _arch_exec.shutdown(wait=False, cancel_futures=True)
+            raise
+
+        # Only cache arch docs if all 5 succeeded — a transient failure
+        # (rate limit, timeout) must not be permanently cached.
+        if cache_dir and arch_key and not _arch_any_failed:
+            _cache.arch = _ArchCacheEntry(
+                cache_key=arch_key,
+                system_overview=guide.system_overview,
+                arc42=guide.arc42,
+                domain_model_mermaid=guide.domain_model_mermaid,
+                data_flow_mermaid=guide.data_flow_mermaid,
+                dir_c4_components=guide.dir_c4_components,
+                c4_context_mermaid=guide.c4_context_mermaid,
+                c4_container_mermaid=guide.c4_container_mermaid,
+            )
+            _save_narrative_cache(cache_dir, _cache)
+        elif _arch_any_failed:
+            log("  [cache] arch docs not cached — re-run to retry failed docs")
 
     # ── Guided tour ───────────────────────────────────────────────────────
     guide.guided_tour = _build_guided_tour(guide, graph, history)
