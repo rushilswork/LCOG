@@ -234,14 +234,19 @@ def _call_llm_once(prompt: str, provider: str, api_key: str, model: str, max_tok
         return resp.choices[0].message.content.strip()
 
     elif provider == "gemini":
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        gemini_model = genai.GenerativeModel(model)
-        resp = gemini_model.generate_content(prompt)
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+            ),
+        )
         # Gemini may block a response due to safety filters
-        if not resp.parts:
-            reason = getattr(resp.prompt_feedback, "block_reason", "unknown")
-            raise ValueError(f"Gemini blocked the response (reason: {reason})")
+        if not resp.text:
+            raise ValueError("Gemini returned an empty response (possibly blocked by safety filters)")
         return resp.text.strip()
 
     else:
