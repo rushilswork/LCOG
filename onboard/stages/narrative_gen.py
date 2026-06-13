@@ -244,10 +244,23 @@ def _call_llm_once(prompt: str, provider: str, api_key: str, model: str, max_tok
                 max_output_tokens=max_tokens,
             ),
         )
-        # Gemini may block a response due to safety filters
-        if not resp.text:
-            raise ValueError("Gemini returned an empty response (possibly blocked by safety filters)")
-        return resp.text.strip()
+        # In google-genai SDK, resp.text raises ValueError on blocked/empty
+        # responses, so we surface a clear message rather than letting the SDK
+        # raise an opaque error.
+        try:
+            text = resp.text
+        except ValueError:
+            candidates = getattr(resp, "candidates", [])
+            reason = (
+                candidates[0].finish_reason if candidates else "unknown"
+            )
+            raise ValueError(
+                f"Gemini returned no usable content (finish_reason={reason}). "
+                "The response may have been blocked by safety filters."
+            )
+        if not text:
+            raise ValueError("Gemini returned an empty response.")
+        return text.strip()
 
     else:
         raise ValueError(f"Unknown provider '{provider}'. Choose 'groq' or 'gemini'.")

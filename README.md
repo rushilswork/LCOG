@@ -144,15 +144,16 @@ onboard analyze /path/to/repo --serve
 **Option 2: Gemini** (free tier available, no card required)
 
 1. Sign up at [aistudio.google.com](https://aistudio.google.com) and create an API key.
+   New keys start with `AQ.` (auth key format — the old `AIza` format is being retired in 2026).
 2. Run:
 
 ```bash
 # Windows
-set GEMINI_API_KEY=AIza...
+set GEMINI_API_KEY=AQ.Ab...
 onboard analyze C:\path\to\repo --provider gemini --serve
 
 # Mac / Linux
-export GEMINI_API_KEY=AIza...
+export GEMINI_API_KEY=AQ.Ab...
 onboard analyze /path/to/repo --provider gemini --serve
 ```
 
