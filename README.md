@@ -27,10 +27,10 @@ The output is a static site with:
 
 ## How it works
 
-Stages 1–3 run **in parallel** (fully independent). Stage 4 starts once all three finish.
+Stages 1–3 run **in parallel** (fully independent). A skeleton site is written immediately after they finish — you can open it in the browser while Stage 4 runs in the background.
 
 **Stage 1 — Static analysis**
-Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, TSX, C/C++, and Java. Files are parsed in parallel using a thread pool (tree-sitter releases the GIL, so threads run on real cores). Builds a directed dependency graph. Files larger than 500 KB and standard noise directories (`node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.) are skipped automatically.
+Walks the repo with tree-sitter, extracting classes, functions, and import relationships for Python, JavaScript, TypeScript, TSX, C/C++, and Java. Files are parsed in parallel using a thread pool (tree-sitter releases the GIL, so threads run on real cores). Builds a directed dependency graph. Files larger than 500 KB and standard noise directories (`node_modules`, `__pycache__`, `.venv`, `dist`, `build`, etc.) are skipped automatically. Parse results are cached in `.onboard_cache/parse_cache.pkl` keyed by file path + mtime + size — unchanged files are skipped entirely on subsequent runs.
 
 **Stage 2 — Git history**
 Reads the entire git log in a single subprocess call (`git log --name-only`), then computes change frequency per file, co-change coupling, author ownership, and recurring themes from commit messages. This is 10–50x faster than per-commit diff approaches on large histories. Degrades gracefully on repos with no history, bare repos, or missing git.
@@ -38,33 +38,38 @@ Reads the entire git log in a single subprocess call (`git log --name-only`), th
 **Stage 3 — Doc collection**
 Finds READMEs, architecture docs, Python docstrings, JSDoc, and Doxygen comments and links them to the files they describe. Source file processing runs in parallel. Restricts prose collection to `.md` and `.rst` to avoid false positives.
 
-**Stage 4 — LLM narratives** *(skipped with --skip-llm)*
-Sends each module's structure + history + docs to an LLM and generates rich per-module content. Also runs five additional generation passes:
+**Skeleton site** *(between stages 3 and 4)*
+Immediately after stages 1–3 finish, the tool writes a full skeleton site with stub pages for every module. If `--serve` is passed, `mkdocs serve` starts and the browser opens at this point — you don't wait for the LLM. As Stage 4 completes each module narrative, the corresponding `.md` file is overwritten in-place and mkdocs serve's file watcher picks it up automatically (live refresh).
 
-1. **Per-module narratives** — summary, architecture notes, code walkthrough, how-to-use guide, key design decisions, patterns, pitfalls, plus conditional sequence/state/data-flow diagrams for complex modules
+**Stage 4 — LLM narratives** *(skipped with --skip-llm)*
+Sends each module's structure + history + docs to an LLM and generates rich per-module content. Also runs five additional generation passes (all five run in parallel at the end):
+
+1. **Per-module narratives** — summary, architecture notes, code walkthrough, how-to-use guide, key design decisions, patterns, pitfalls, plus conditional sequence/state/data-flow diagrams for complex modules. Up to 8 modules generated concurrently. Trivial modules (fewer than 3 symbols, no dependants, no git history) are skipped — typically 30–40% of files in large repos.
 2. **System overview** — high-level narrative covering the whole codebase
 3. **Arc42 document** — 12-section architecture spec; C4 Context and Container diagrams are extracted from it automatically
 4. **Domain model** — ER diagram of entities and relationships
 5. **Data flow diagram** — DFD showing data movement through the system
 6. **C4 Component diagrams** — one per top-level directory, showing internal components and their interactions
 
-All six generation passes run concurrently (up to 3 LLM requests in flight at once) with per-request exponential backoff + jitter on rate limits. Any single failed LLM call produces a stub — the guide always completes.
+The five architecture passes (2–6) run concurrently in a dedicated 5-worker pool after all module narratives complete. Any single failed LLM call produces a clean warning admonition in the page — the guide always completes. Re-run with `--retry-failed` to regenerate only the failed pages.
 
 **Tech detector (zero LLM, always runs)**
 Before any AI calls, a static scan identifies frameworks (Flask, FastAPI, Django, etc.) and external systems (PostgreSQL, Redis, AWS, Kafka, etc.) directly from import statements. This grounds every AI prompt with real signal, reducing hallucination in diagrams.
 
-### Performance on large codebases
+### Performance
 
-| | Sequential (old) | Parallel (current) |
+| | Before | After |
 |---|---|---|
-| Stage 1 (2 000 files) | ~60s | ~8s |
+| Stage 1 (2 000 files, cold) | ~60s | ~8s |
+| Stage 1 (2 000 files, warm cache) | ~60s | ~1s |
 | Stage 2 (5 000 commits) | ~120s | ~2s |
 | Stage 3 (2 000 files) | ~20s | ~4s |
-| Stages 1–3 combined | ~200s | ~8s (parallel) |
-| Stage 4 (50 modules, LLM) | ~150s | ~55s (3 concurrent) |
-| **Total (with LLM)** | **~6 min** | **~1 min** |
+| Stages 1–3 combined (parallel) | ~200s | ~8s cold / ~3s warm |
+| **Skeleton site ready** | after stage 4 | **after stage 3** |
+| Stage 4 (50 modules, 8b-instant) | ~150s (3 concurrent) | ~40s (8 concurrent + trivial skip) |
+| **Total (with LLM)** | **~6 min** | **~50s** |
 
-`--skip-llm` on a large monolith: ~200s → ~8s (~25x faster).
+`--skip-llm` on a large monolith: cold ~8s, warm ~3s.
 
 ---
 
@@ -161,24 +166,52 @@ onboard analyze <repo_path> [OPTIONS]
   -o, --output DIR        Where to write the site  [default: <repo>/onboarding-guide]
   --provider TEXT         groq or gemini           [default: groq]
   --api-key TEXT          API key (or use env var)
-  --model TEXT            Override the default model
+  --model TEXT            Override the default model (takes precedence over --model-tier)
+  --model-tier TEXT       fast | balanced | best   [default: fast]
   --site-name TEXT        Site title
   --max-modules INT       Max modules sent to LLM  [default: 50]
-  --skip-llm              Run stages 1-3 only, no LLM
-  --serve                 Run mkdocs serve after generation and open browser
+  --skip-llm              Run stages 1-3 only, no LLM calls
+  --serve                 Start mkdocs serve after skeleton build; browser opens immediately
   --workers INT           Parallel workers for file parsing  [default: auto]
+  --retry-failed          Re-generate only modules whose narrative previously failed
+  --no-cache              Skip parse cache; re-parse all files from scratch
 ```
 
 `--workers` defaults to `min(8, cpu_count)`. Increase on machines with more cores; reduce if memory is limited on very large repos.
+
+### Model tiers
+
+`--model-tier` picks a preset model without requiring you to know the exact model string. `--model` overrides everything.
+
+| Provider | `--model-tier fast` | `--model-tier balanced` / `best` |
+|----------|---------------------|-----------------------------------|
+| groq     | llama-3.1-8b-instant | llama-3.3-70b-versatile |
+| gemini   | gemini-2.0-flash | gemini-2.0-flash / gemini-1.5-pro |
+
+`fast` is the default. It uses the highest-throughput model for each provider — dramatically fewer 429 errors on large repos, and 2–3× faster wall time than the 70b model.
 
 **Providers**
 
 | Provider | Default model            | Free tier | Sign up                   |
 |----------|--------------------------|-----------|---------------------------|
-| groq     | llama-3.3-70b-versatile  | Yes       | console.groq.com          |
-| gemini   | gemini-1.5-flash         | Yes       | aistudio.google.com       |
+| groq     | llama-3.1-8b-instant     | Yes       | console.groq.com          |
+| gemini   | gemini-2.0-flash         | Yes       | aistudio.google.com       |
 
 **Env vars:** `GROQ_API_KEY`, `GEMINI_API_KEY`
+
+### Retrying failed modules
+
+If some modules failed during generation (rate limit exhausted, network blip), re-run with `--retry-failed` instead of regenerating everything:
+
+```bash
+onboard analyze /path/to/repo --retry-failed
+```
+
+This scans the existing `docs/modules/*.md` files for `"Narrative unavailable"` admonitions, extracts the affected file paths, and only re-runs the LLM for those modules. The rest of the guide is untouched.
+
+### Parse cache
+
+On the second run against an unchanged repo, Stage 1 skips tree-sitter parsing for every file whose path, modification time, and size match the cached result. The cache lives at `<repo>/.onboard_cache/parse_cache.pkl`. Pass `--no-cache` to force a full re-parse.
 
 ---
 
@@ -201,6 +234,9 @@ onboard analyze <repo_path> [OPTIONS]
       <slug>.md        ← per-module page: 11 sections including code walkthrough + diagrams
     css/
       extra.css
+
+<repo>/.onboard_cache/
+  parse_cache.pkl      ← tree-sitter parse results (path + mtime + size keyed)
 ```
 
 The MkDocs nav groups modules under their top-level directory automatically. Arc42, Domain Model, and Data Flow appear as top-level nav items under an "Architecture" section.
@@ -223,7 +259,9 @@ Each module page contains 11 sections:
 10. **Pitfalls** — what breaks, what's fragile, what surprised past contributors
 11. **Sequence / State machine / Data flow diagrams** — AI-generated Mermaid diagrams for complex modules (hotspots, modules with many symbols, managers, handlers, pipelines)
 
-Sections 11 diagrams only appear for modules that meet a complexity threshold: hotspot (>20 commits), high symbol count (>8), or name hints (`manager`, `handler`, `pipeline`, `service`, `processor`, `router`, `dispatcher`).
+Section 11 diagrams only appear for modules that meet a complexity threshold: hotspot (>20 commits), high symbol count (>8), or name hints (`manager`, `handler`, `pipeline`, `service`, `processor`, `router`, `dispatcher`).
+
+Trivial modules (fewer than 3 symbols, nothing imports them, no git history) are skipped by the LLM and receive a short stub instead. This is typically 30–40% of files in a large repo and cuts Stage 4 time proportionally.
 
 ---
 
@@ -266,14 +304,14 @@ The generated site includes a full interactive dependency graph (`graph.html`) a
 
 **Performance cap:** On repos with more than 200 parsed files, the graph shows the top 200 by connectivity (highest-degree nodes). The rest appear in the file tree page.
 
-Click any node to open that module's page.
+Click any node to navigate directly to that module's page.
 
 ---
 
 ## Notes
 
-- If you hit rate limits on a large repo, use `--max-modules 20` on the first run and increase from there.
-- Re-run the same command against the same repo to refresh the guide as the codebase changes. The output directory is overwritten in place.
+- If you hit rate limits on a large repo, use `--max-modules 20` on the first run and increase from there, or switch to `--model-tier fast`.
+- Re-run the same command against the same repo to refresh the guide as the codebase changes. The output directory is overwritten in place; the parse cache speeds up Stage 1 significantly.
 - The `onboarding-guide` output directory is excluded from analysis, so running the tool on its own repo won't recurse.
 - Repos with no git history, bare repos, or repos on machines without git installed all run fine — Stage 2 degrades gracefully and returns empty history.
 - The interactive graph requires an internet connection to load vis.js from the unpkg CDN. All other pages are fully offline once generated.
@@ -288,18 +326,22 @@ Click any node to open that module's page.
 
 **`onboard: command not found`** — run `pip install -e .` from the repo root, or invoke directly with `python -m onboard`.
 
-**CLI shows "Stage 1 -- Static structure mapping" (old UI)** — your `onboard` executable is stale. Force a reinstall: `pip install -e . --force-reinstall`, then re-run.
+**Rate limit errors (429)** — Stage 4 retries automatically up to 5 times with exponential backoff and jitter. If consistently throttled, switch to `--model-tier fast` (uses llama-3.1-8b-instant / gemini-2.0-flash, which have much higher throughput limits) or reduce `--max-modules`.
 
-**Rate limit errors (429)** — Stage 4 retries automatically with backoff and jitter. If consistently throttled, try `--provider gemini` or reduce `--max-modules`.
+**Module pages show "Narrative unavailable"** — one or more modules failed during generation (usually rate limits). Re-run with `--retry-failed` to regenerate only those pages without re-running the whole pipeline.
 
-**Module pages show stubs** — you ran with `--skip-llm`. Re-run without the flag and with a valid API key to get full narratives.
+**Module pages show stubs ("Generating narrative...")** — you ran with `--skip-llm`. Re-run without the flag with a valid API key.
 
 **Arc42 / domain model / data flow pages show stubs** — same as above; these are LLM-generated. Re-run without `--skip-llm`.
 
+**Skeleton site looks empty** — normal. The skeleton site contains stub pages while Stage 4 runs in the background. Module pages fill in progressively if `--serve` is active; otherwise do a full refresh after Stage 4 completes.
+
 **Windows encoding errors in terminal** — set `PYTHONUTF8=1` before running: `set PYTHONUTF8=1 && onboard analyze ...`
 
-**Stage 1 seems slow on first run** — tree-sitter compiles language grammars on first use and caches them. Subsequent runs are faster.
+**Stage 1 seems slow on first run** — tree-sitter compiles language grammars on first use and caches them. Subsequent runs are faster. The parse cache also only kicks in from the second run onward.
 
 **Graph shows fewer nodes than expected** — the interactive graph caps at 200 nodes (top by connectivity). All files appear in the File Tree page regardless of the cap.
 
 **C4 diagrams not rendering** — make sure you are using `mkdocs-material` (not plain `mkdocs`). Run `pip install mkdocs-material` and check that `mkdocs.yml` has `markdown_extensions: [pymdownx.superfences]` — the builder adds this automatically.
+
+**Node clicks in the graph give 404 errors** — this should not happen with current versions. If you have a guide generated by an older version, re-run `onboard analyze` to regenerate it with root-relative URLs.

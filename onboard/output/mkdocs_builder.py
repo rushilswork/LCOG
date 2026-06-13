@@ -88,7 +88,8 @@ def _mermaid_graph(graph: nx.DiGraph, max_nodes: int = 30) -> str:
     lines.append("    classDef entry fill:#f9a,stroke:#c55,stroke-width:2px;")
     for node in sub.nodes():
         slug = _slugify(node)
-        lines.append(f'    click {slug} "modules/{slug}/"')
+        # Root-relative URL avoids 404 regardless of which page hosts this diagram
+        lines.append(f'    click {slug} "/modules/{slug}/"')
     lines.append("```")
     return "\n".join(lines)
 
@@ -442,10 +443,11 @@ def _build_interactive_graph(graph: nx.DiGraph) -> str:
         else:
             bg, border = color_map.get(top_dir, ("#dce8f7", "#5a8fc2"))
             color_str = f'{{"background":"{bg}","border":"{border}"}}'
+        # Root-relative URL (/modules/...) so clicks work from any page depth
         nodes_js.append(
             "{" + f"id:{json.dumps(node)},label:{json.dumps(label)},"
             f"title:{json.dumps(node)},group:{json.dumps(top_dir)},"
-            f"color:{color_str},url:\"modules/{slug}/\"" + "}"
+            f"color:{color_str},url:\"/modules/{slug}/\"" + "}"
         )
 
     edges_js = [
@@ -785,6 +787,22 @@ def _build_mkdocs_yml(site_name: str, module_paths: list,
         "nav:\n"
         + nav_indented + "\n"
     )
+
+
+# ── Progressive update helper ─────────────────────────────────────────────────
+
+def update_module_page(mod: ModuleNarrative, graph: nx.DiGraph, modules_dir: Path) -> None:
+    """Overwrite a single module's .md page in-place.
+
+    Called by the progressive build callback as each narrative finishes —
+    mkdocs serve picks up the file change via its watcher automatically.
+    """
+    slug = _slugify(mod.path)
+    content = _build_module_page(mod, graph)
+    try:
+        (modules_dir / f"{slug}.md").write_text(content, encoding="utf-8")
+    except OSError:
+        pass  # best-effort; full rebuild at the end will fix any missed pages
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────

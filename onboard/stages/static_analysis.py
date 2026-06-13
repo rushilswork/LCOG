@@ -1,6 +1,6 @@
 """Stage 1: Static structure mapping via tree-sitter."""
 from __future__ import annotations
-import itertools, os, threading
+import itertools, os, pickle, threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -181,7 +181,40 @@ def _process_file(
     is_entry = _is_entry_point(source_str, language)
     return rel_path.as_posix(), language, symbols, imports, is_entry, rel_path
 
-def analyze_repo(repo_path: Path, max_file_kb: int = 500, workers: int = 0) -> nx.DiGraph:
+# ---------------------------------------------------------------------------
+# Parse cache  (keyed by abs_path + mtime + size → parse result tuple)
+# ---------------------------------------------------------------------------
+
+def _load_parse_cache(cache_dir: Path) -> dict:
+    """Load cached parse results from disk. Returns empty dict on any failure."""
+    try:
+        cache_file = cache_dir / "parse_cache.pkl"
+        if cache_file.exists():
+            with open(cache_file, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_parse_cache(cache_dir: Path, cache: dict) -> None:
+    """Persist parse cache to disk. Best-effort — failures are silently ignored."""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_dir / "parse_cache.pkl", "wb") as f:
+            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+def analyze_repo(
+    repo_path: Path,
+    max_file_kb: int = 500,
+    workers: int = 0,
+    cache_dir: Optional[Path] = None,
+) -> nx.DiGraph:
     """Walk *repo_path* and build a directed module dependency graph.
 
     Parameters
@@ -189,6 +222,9 @@ def analyze_repo(repo_path: Path, max_file_kb: int = 500, workers: int = 0) -> n
     workers:
         Number of parallel worker threads for file parsing.
         0 (default) = auto (min(8, cpu_count)).
+    cache_dir:
+        Directory for the parse result cache.  Pass None to disable caching.
+        Typically ``repo_path / ".onboard_cache"``.
     """
     graph: nx.DiGraph = nx.DiGraph()
     file_nodes: dict[str, FileNode] = {}
@@ -213,17 +249,51 @@ def analyze_repo(repo_path: Path, max_file_kb: int = 500, workers: int = 0) -> n
                 continue
             candidates.append((abs_path, rel_path, language))
 
-    # ── Pass 2: parse files in parallel ──────────────────────────────────────
+    # ── Pass 2: check cache, then parse uncached files in parallel ────────────
     # tree-sitter is a C extension — releases the GIL during parse so threads
     # run in genuine parallel on multi-core machines.
     num_workers = workers if workers > 0 else min(8, os.cpu_count() or 4)
 
+    _cache: dict = _load_parse_cache(cache_dir) if cache_dir else {}
+    _new_entries: dict = {}
+
+    # Split candidates into cache-hits and misses
+    cached_results: list[tuple] = []
+    to_parse: list[tuple[Path, Path, str, Optional[tuple]]] = []
+
+    for abs_path, rel_path, language in candidates:
+        ck: Optional[tuple] = None
+        if cache_dir:
+            try:
+                st = abs_path.stat()
+                ck = (str(abs_path), st.st_mtime, st.st_size)
+                if ck in _cache:
+                    cached_results.append(_cache[ck])
+                    continue
+            except OSError:
+                pass
+        to_parse.append((abs_path, rel_path, language, ck))
+
+    def _add_result(result: tuple) -> None:
+        key, lang, symbols, imports, is_entry, rp = result
+        file_nodes[key] = FileNode(
+            path=rp, language=lang,
+            symbols=symbols, imports=imports, is_entry_point=is_entry,
+        )
+        graph.add_node(key, language=lang, symbols=symbols, imports=imports,
+            is_entry_point=is_entry, label=rp.stem)
+
+    # Apply cache hits instantly
+    for result in cached_results:
+        _add_result(result)
+
+    # Parse uncached files in parallel
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         future_list = [
-            executor.submit(_process_file, abs_path, rel_path, language, max_file_kb)
-            for abs_path, rel_path, language in candidates
+            (executor.submit(_process_file, ap, rp, lang, max_file_kb), ck)
+            for ap, rp, lang, ck in to_parse
         ]
-        for future in future_list:
+        for future, ck in future_list:
             try:
                 result = future.result()
             except Exception:
@@ -231,13 +301,14 @@ def analyze_repo(repo_path: Path, max_file_kb: int = 500, workers: int = 0) -> n
                 continue
             if result is None:
                 continue
-            key, lang, symbols, imports, is_entry, rel_path = result
-            file_nodes[key] = FileNode(
-                path=rel_path, language=lang,
-                symbols=symbols, imports=imports, is_entry_point=is_entry,
-            )
-            graph.add_node(key, language=lang, symbols=symbols, imports=imports,
-                is_entry_point=is_entry, label=rel_path.stem)
+            _add_result(result)
+            if ck is not None:
+                _new_entries[ck] = result
+
+    # Persist new entries to cache
+    if cache_dir and _new_entries:
+        _cache.update(_new_entries)
+        _save_parse_cache(cache_dir, _cache)
 
     # ── Pass 3: build dependency edges (sequential — pure in-memory) ─────────
     path_index = _build_path_index(file_nodes)

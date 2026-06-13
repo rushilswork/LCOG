@@ -254,6 +254,10 @@ def collect_docs(repo_path: Path) -> DocCorpus:
             for abs_path, rel in candidates
         ]
         for future in futures:
-            corpus.fragments.extend(future.result())
+            try:
+                corpus.fragments.extend(future.result())
+            except Exception:
+                # Skip files that raise unexpected exceptions (MemoryError, etc.)
+                continue
 
     return corpus

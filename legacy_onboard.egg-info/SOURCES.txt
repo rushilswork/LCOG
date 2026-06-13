@@ -15,4 +15,5 @@ onboard/stages/doc_collector.py
 onboard/stages/git_analysis.py
 onboard/stages/narrative_gen.py
 onboard/stages/static_analysis.py
+onboard/stages/tech_detector.py
 onboard/utils/__init__.py

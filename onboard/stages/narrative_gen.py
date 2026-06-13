@@ -1,8 +1,8 @@
 """Stage 4: LLM-powered narrative generation.
 
 Supported providers (set via --provider):
-  groq    -- Groq cloud API (fast, free tier available). Default model: llama-3.3-70b-versatile
-  gemini  -- Google Gemini API (free tier available).    Default model: gemini-1.5-flash
+  groq    -- Groq cloud API (fast, free tier available). Default model: llama-3.1-8b-instant
+  gemini  -- Google Gemini API (free tier available).    Default model: gemini-2.0-flash
 
 For each module / file group, synthesises:
 - What this module does
@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import networkx as nx
 
@@ -35,16 +35,29 @@ from onboard.stages.static_analysis import Symbol
 
 
 # ---------------------------------------------------------------------------
-# Provider defaults
+# Provider defaults  (fast by default to avoid 429s)
 # ---------------------------------------------------------------------------
 
 PROVIDER_DEFAULTS: dict[str, dict] = {
-    "groq":   {"model": "llama-3.3-70b-versatile", "max_tokens": 2500},
-    "gemini": {"model": "gemini-1.5-flash",         "max_tokens": 2500},
+    "groq":   {"model": "llama-3.1-8b-instant", "max_tokens": 2500},
+    "gemini": {"model": "gemini-2.0-flash",      "max_tokens": 2500},
 }
 
-# Max concurrent LLM requests (tune down if hitting rate limits)
-_LLM_MAX_CONCURRENT = 3
+MODEL_TIERS: dict[str, dict[str, str]] = {
+    "groq": {
+        "fast":     "llama-3.1-8b-instant",    # ~10× higher RPM than 70b
+        "balanced": "llama-3.3-70b-versatile",
+        "best":     "llama-3.3-70b-versatile",
+    },
+    "gemini": {
+        "fast":     "gemini-2.0-flash",
+        "balanced": "gemini-2.0-flash",
+        "best":     "gemini-1.5-pro",
+    },
+}
+
+# Max concurrent LLM requests — 8b-instant supports much higher throughput
+_LLM_MAX_CONCURRENT = 8
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +91,13 @@ class OnboardingGuide:
     modules: dict[str, ModuleNarrative] = field(default_factory=dict)
     guided_tour: str = ""
     major_themes: list[str] = field(default_factory=list)
-    # ── New: architecture docs ──────────────────────────────────────────
-    arc42: str = ""                          # full Arc42 document (markdown)
-    c4_context_mermaid: str = ""             # C4Context diagram for home page
-    c4_container_mermaid: str = ""           # C4Container diagram (inside arc42)
-    domain_model_mermaid: str = ""           # ER / domain model diagram
-    data_flow_mermaid: str = ""              # Data Flow Diagram
-    dir_c4_components: dict[str, str] = field(default_factory=dict)  # dir → C4Component mermaid
+    # ── Architecture docs ──────────────────────────────────────────────────
+    arc42: str = ""
+    c4_context_mermaid: str = ""
+    c4_container_mermaid: str = ""
+    domain_model_mermaid: str = ""
+    data_flow_mermaid: str = ""
+    dir_c4_components: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +169,7 @@ def _extract_section(text: str, heading: str) -> str:
 
 
 def _extract_mermaid(text: str, diagram_type: str) -> str:
-    """Extract the first Mermaid block of a given type from LLM output.
-
-    diagram_type examples: 'sequenceDiagram', 'stateDiagram', 'flowchart',
-    'C4Context', 'C4Container', 'C4Component', 'erDiagram'
-    """
-    # Match ```mermaid ... ``` blocks containing the diagram type
+    """Extract the first Mermaid block of a given type from LLM output."""
     pattern = r"```mermaid\s*\n(.*?)```"
     for match in re.finditer(pattern, text, re.DOTALL):
         body = match.group(1)
@@ -175,13 +183,7 @@ def _extract_mermaid(text: str, diagram_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _esc(s: str) -> str:
-    """Escape curly braces in user content so str.format() does not crash.
-
-    Docstrings, commit messages, and symbol names regularly contain curly
-    braces: Python dicts ("returns {key: val}"), TypeScript generics
-    ("{T extends object}"), commit messages ("add {env} support"), etc.
-    Without escaping these, MODULE_PROMPT.format(...) raises KeyError.
-    """
+    """Escape curly braces in user content so str.format() does not crash."""
     return s.replace("{", "{{").replace("}", "}}")
 
 
@@ -190,8 +192,8 @@ def _esc(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 _RATE_LIMIT_SIGNALS = ("rate_limit", "429", "too many", "quota", "resource_exhausted")
-_MAX_RETRIES = 3
-_RETRY_BACKOFF_BASE = 5  # seconds; doubles each attempt
+_MAX_RETRIES = 5
+_RETRY_BACKOFF_BASE = 8  # seconds; doubles each attempt
 
 
 def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: int) -> str:
@@ -211,9 +213,7 @@ def _call_llm(prompt: str, provider: str, api_key: str, model: str, max_tokens: 
             err_lower = str(exc).lower()
             is_retriable = any(sig in err_lower for sig in _RATE_LIMIT_SIGNALS)
             if is_retriable and attempt < _MAX_RETRIES - 1:
-                # Exponential backoff + random jitter so concurrent threads
-                # don't all retry at the same instant (thundering herd)
-                wait = _RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
+                wait = _RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 3)
                 time.sleep(wait)
                 continue
             raise
@@ -515,6 +515,9 @@ def _reading_order(graph: nx.DiGraph, history: RepoHistory, entry_points: list[s
 
 _SOURCE_CODE_CHAR_LIMIT = 6000  # ~1500 tokens; keeps prompts manageable
 
+# Trivial module threshold — skip LLM for tiny modules with no git heat
+_TRIVIAL_MAX_SYMBOLS = 3
+
 
 def _read_source(repo_path: Path, rel_path: str) -> str:
     """Read source from disk, capped at _SOURCE_CODE_CHAR_LIMIT chars."""
@@ -525,6 +528,13 @@ def _read_source(repo_path: Path, rel_path: str) -> str:
         return full
     except OSError:
         return "(source file not readable)"
+
+
+def _make_mod_title(path: str) -> str:
+    stem = Path(path).stem
+    if stem == "__init__" and Path(path).parent != Path("."):
+        return Path(path).parent.name.replace("_", " ").title() + " (init)"
+    return stem.replace("_", " ").replace("-", " ").title()
 
 
 def _generate_module(
@@ -551,10 +561,34 @@ def _generate_module(
     dependants = list(graph.predecessors(path))
     dependencies = list(graph.successors(path))
 
+    # ── Trivial module fast-path: skip LLM entirely ──────────────────────
+    # A module is trivial if: few symbols, nothing imports it, no git history.
+    # These are typically small helpers / __init__ re-exports.
+    _is_trivial = (
+        len(symbols) < _TRIVIAL_MAX_SYMBOLS
+        and not dependants
+        and (fh is None or fh.change_frequency == 0)
+    )
+    if _is_trivial:
+        return path, ModuleNarrative(
+            path=path,
+            title=_make_mod_title(path),
+            summary=f"*Small utility module ({lang}) — no significant symbols or git activity.*",
+            walkthrough="",
+            design_notes="",
+            pitfalls="",
+            patterns="",
+            architecture_notes="",
+            entry_points_usage="",
+            code_walkthrough="",
+            sequence_diagram="",
+            state_machine_diagram="",
+            data_flow_snippet="",
+        ), None
+
     source_code = _read_source(repo_path, path) if repo_path else "(source not available)"
 
     # Determine if this module warrants extra diagrams:
-    # hotspots, complex symbol counts, or name hints at state/flow/pipeline
     _name_lower = Path(path).stem.lower()
     _diagram_hints = ("state", "flow", "pipeline", "process", "handler",
                       "worker", "job", "task", "service", "manager", "engine",
@@ -565,9 +599,6 @@ def _generate_module(
         or any(h in _name_lower for h in _diagram_hints)
     )
 
-    # _esc() is CRITICAL: docstrings, commit messages, and symbol names
-    # regularly contain { } (dicts, generics, format strings, etc.) which
-    # would cause KeyError/IndexError in str.format() without escaping.
     prompt_base = MODULE_PROMPT.format(
         path=_esc(path),
         language=_esc(lang),
@@ -586,7 +617,12 @@ def _generate_module(
         err_logged = None
     except Exception as e:
         err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-        raw = f"*Narrative generation failed: {err_msg}*"
+        # Write a clean MkDocs admonition instead of raw error text
+        raw = (
+            "!!! warning \"Narrative unavailable\"\n"
+            "    Generation failed — re-run with `--retry-failed` to retry this module.\n\n"
+            f"    Error: `{err_msg[:200]}`\n"
+        )
         err_logged = err_msg
 
     dead_warn = None
@@ -603,15 +639,9 @@ def _generate_module(
             "Add tests before modifying."
         )
 
-    stem = Path(path).stem
-    if stem == "__init__" and Path(path).parent != Path("."):
-        mod_title = Path(path).parent.name.replace("_", " ").title() + " (init)"
-    else:
-        mod_title = stem.replace("_", " ").replace("-", " ").title()
-
     narrative = ModuleNarrative(
         path=path,
-        title=mod_title,
+        title=_make_mod_title(path),
         summary=_extract_section(raw, "What this module does") or raw[:300],
         walkthrough=_extract_section(raw, "How it fits into the system"),
         design_notes=_extract_section(raw, "Key design decisions"),
@@ -817,6 +847,38 @@ def _generate_c4_components(
     return results
 
 
+def _build_overview_prompt(
+    graph: nx.DiGraph,
+    history: RepoHistory,
+    corpus: DocCorpus,
+    modules_to_process: list[str],
+) -> str:
+    from onboard.stages.static_analysis import summarize_graph
+    summary = summarize_graph(graph)
+
+    hotspot_lines = []
+    sorted_files = sorted(
+        history.files.values(),
+        key=lambda fh: fh.change_frequency,
+        reverse=True,
+    )
+    for fh in sorted_files[:10]:
+        hotspot_lines.append(f"  {fh.path}  ({fh.change_frequency} commits)")
+
+    arch_docs = corpus.arch_docs()
+    arch_text = "\n".join(f.content[:300] for f in arch_docs[:3]) or "None found."
+
+    return OVERVIEW_PROMPT.format(
+        total_files=summary["total_files"],
+        languages=_esc(str(summary["languages"])),
+        entry_points=_esc(", ".join(summary["entry_points"][:10]) or "none detected"),
+        hotspots=_esc("\n".join(hotspot_lines) or "  (no git history)"),
+        themes=_esc(", ".join(history.major_themes[:10]) or "none detected"),
+        arch_docs=_esc(arch_text),
+        reading_order=_esc("\n".join(f"  {p}" for p in modules_to_process[:20])),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -832,8 +894,15 @@ def generate_guide(
     max_tokens: int = 2500,
     max_modules: int = 50,
     console=None,
+    module_done_callback: Optional[Callable[[str, ModuleNarrative], None]] = None,
+    only_paths: Optional[list[str]] = None,
 ) -> OnboardingGuide:
-    """Run the full LLM narrative generation pipeline."""
+    """Run the full LLM narrative generation pipeline.
+
+    module_done_callback: called on the thread-pool thread each time a module
+        narrative finishes — use to write progressive page updates.
+    only_paths: if set, only narrate these specific paths (used by --retry-failed).
+    """
     from onboard.stages.tech_detector import detect_tech_context
     from onboard.stages.tech_detector import TechContext
 
@@ -854,13 +923,19 @@ def generate_guide(
     entry_points = [n for n, d in graph.nodes(data=True) if d.get("is_entry_point")]
     reading_order = _reading_order(graph, history, entry_points)
     guide.reading_order = reading_order
-    modules_to_process = reading_order[:max_modules]
+
+    # If retrying specific paths, only process those; otherwise use reading order
+    if only_paths:
+        modules_to_process = [p for p in reading_order if p in set(only_paths)]
+        modules_to_process += [p for p in only_paths if p not in set(reading_order)]
+    else:
+        modules_to_process = reading_order[:max_modules]
 
     log(f"Provider: {provider} | Model: {model}")
     log(f"Generating narratives for {len(modules_to_process)} modules "
         f"({_LLM_MAX_CONCURRENT} concurrent)...")
 
-    # ---- Concurrent module narrative generation --------------------------------
+    # ── Concurrent module narrative generation ────────────────────────────
     raw_results: dict[str, ModuleNarrative] = {}
     done_count = 0
 
@@ -884,6 +959,12 @@ def generate_guide(
             if err_logged:
                 log(f"    [warning] {err_logged}")
             raw_results[path] = narrative
+            # Progressive callback — fires as soon as each module is done
+            if module_done_callback:
+                try:
+                    module_done_callback(path, narrative)
+                except Exception:
+                    pass
 
     # Restore reading order and assign index
     for idx, path in enumerate(modules_to_process):
@@ -891,7 +972,7 @@ def generate_guide(
             raw_results[path].reading_order_index = idx
             guide.modules[path] = raw_results[path]
 
-    # ---- Tech context (static, no LLM) ----------------------------------------
+    # ── Tech context (static, no LLM) ────────────────────────────────────
     log("Detecting technology context...")
     try:
         tech = detect_tech_context(graph)
@@ -900,77 +981,76 @@ def generate_guide(
         log(f"  [warning] tech detection failed: {e}")
         tech = TechContext()
 
-    # ---- System overview -------------------------------------------------------
-    log("Generating system overview...")
+    # ── Architecture docs — all 5 LLM calls run in parallel ──────────────
+    log("Generating architecture documents (parallel)...")
+    overview_prompt = _build_overview_prompt(graph, history, corpus, modules_to_process)
 
-    from onboard.stages.static_analysis import summarize_graph
-    summary = summarize_graph(graph)
-
-    hotspot_lines = []
-    sorted_files = sorted(
-        history.files.values(),
-        key=lambda fh: fh.change_frequency,
-        reverse=True,
-    )
-    for fh in sorted_files[:10]:
-        hotspot_lines.append(f"  {fh.path}  ({fh.change_frequency} commits)")
-
-    arch_docs = corpus.arch_docs()
-    arch_text = "\n".join(f.content[:300] for f in arch_docs[:3]) or "None found."
-
-    overview_prompt = OVERVIEW_PROMPT.format(
-        total_files=summary["total_files"],
-        languages=_esc(str(summary["languages"])),
-        entry_points=_esc(", ".join(summary["entry_points"][:10]) or "none detected"),
-        hotspots=_esc("\n".join(hotspot_lines) or "  (no git history)"),
-        themes=_esc(", ".join(history.major_themes[:10]) or "none detected"),
-        arch_docs=_esc(arch_text),
-        reading_order=_esc("\n".join(f"  {p}" for p in modules_to_process[:20])),
-    )
-
-    try:
-        guide.system_overview = _call_llm(
-            overview_prompt, provider, api_key, model, max_tokens
+    with ThreadPoolExecutor(max_workers=5) as arch_exec:
+        f_overview = arch_exec.submit(
+            _call_llm, overview_prompt, provider, api_key, model, max_tokens
         )
-    except Exception as e:
-        err_msg = str(e).replace(api_key, "***") if api_key else str(e)
-        guide.system_overview = f"*Overview generation failed: {err_msg}*"
-        log(f"  [warning] overview: {err_msg}")
+        f_arc42 = arch_exec.submit(
+            _generate_arc42,
+            graph, history, corpus, tech, modules_to_process[:20],
+            provider, api_key, model, max_tokens,
+        )
+        f_domain = arch_exec.submit(
+            _generate_domain_model,
+            graph, tech, provider, api_key, model, max_tokens,
+        )
+        f_dfd = arch_exec.submit(
+            _generate_dfd,
+            graph, tech, provider, api_key, model, max_tokens,
+        )
+        f_c4 = arch_exec.submit(
+            _generate_c4_components,
+            graph, provider, api_key, model, max_tokens,
+        )
 
-    # Extract C4 context diagram from overview if present
-    guide.c4_context_mermaid = _extract_mermaid(guide.system_overview, "C4Context")
+        # Collect results (order matters for C4 extraction)
+        try:
+            guide.system_overview = f_overview.result()
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            guide.system_overview = f"*Overview generation failed: {err_msg}*"
+            log(f"  [warning] overview: {err_msg}")
 
-    # ---- Arc42 architecture document ------------------------------------------
-    log("Generating Arc42 architecture document...")
-    arc42_text = _generate_arc42(
-        graph, history, corpus, tech, modules_to_process[:20],
-        provider, api_key, model, max_tokens,
-    )
-    guide.arc42 = arc42_text
-    guide.c4_context_mermaid = (
-        guide.c4_context_mermaid or _extract_mermaid(arc42_text, "C4Context")
-    )
-    guide.c4_container_mermaid = _extract_mermaid(arc42_text, "C4Container")
+        guide.c4_context_mermaid = _extract_mermaid(guide.system_overview, "C4Context")
 
-    # ---- Domain model ---------------------------------------------------------
-    log("Generating domain model...")
-    guide.domain_model_mermaid = _generate_domain_model(
-        graph, tech, provider, api_key, model, max_tokens,
-    )
+        try:
+            arc42_text = f_arc42.result()
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            arc42_text = f"*Arc42 generation failed: {err_msg}*"
+            log(f"  [warning] arc42: {err_msg}")
+        guide.arc42 = arc42_text
+        guide.c4_context_mermaid = (
+            guide.c4_context_mermaid or _extract_mermaid(arc42_text, "C4Context")
+        )
+        guide.c4_container_mermaid = _extract_mermaid(arc42_text, "C4Container")
 
-    # ---- Data flow diagram ----------------------------------------------------
-    log("Generating data flow diagram...")
-    guide.data_flow_mermaid = _generate_dfd(
-        graph, tech, provider, api_key, model, max_tokens,
-    )
+        try:
+            guide.domain_model_mermaid = f_domain.result()
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            guide.domain_model_mermaid = f"*Domain model generation failed: {err_msg}*"
+            log(f"  [warning] domain model: {err_msg}")
 
-    # ---- C4 component diagrams (one per top-level directory) ------------------
-    log("Generating C4 component diagrams...")
-    guide.dir_c4_components = _generate_c4_components(
-        graph, provider, api_key, model, max_tokens,
-    )
+        try:
+            guide.data_flow_mermaid = f_dfd.result()
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            guide.data_flow_mermaid = f"*Data flow generation failed: {err_msg}*"
+            log(f"  [warning] data flow: {err_msg}")
 
-    # ---- Guided tour ----------------------------------------------------------
+        try:
+            guide.dir_c4_components = f_c4.result()
+        except Exception as e:
+            err_msg = str(e).replace(api_key, "***") if api_key else str(e)
+            guide.dir_c4_components = {}
+            log(f"  [warning] C4 components: {err_msg}")
+
+    # ── Guided tour ───────────────────────────────────────────────────────
     guide.guided_tour = _build_guided_tour(guide, graph, history)
 
     return guide
@@ -1002,7 +1082,9 @@ def _build_guided_tour(
 
         if mod.summary:
             first_para = mod.summary.split("\n\n")[0].strip()
-            lines.append(first_para + "\n")
+            # Don't include admonition blocks in the tour summary
+            if not first_para.startswith("!!!"):
+                lines.append(first_para + "\n")
 
         fh = history.files.get(path)
         if fh:
