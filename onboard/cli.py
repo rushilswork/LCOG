@@ -271,11 +271,12 @@ def analyze(
                 prog.update(task_id,
                     description=f"[green]done {label}[/green]  [dim]({t_str})[/dim]")
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            f1 = executor.submit(analyze_repo, repo_path, workers=workers,
-                                 cache_dir=cache_dir)
-            f2 = executor.submit(analyze_git, repo_path)
-            f3 = executor.submit(collect_docs, repo_path)
+        _stage_exec = ThreadPoolExecutor(max_workers=3)
+        try:
+            f1 = _stage_exec.submit(analyze_repo, repo_path, workers=workers,
+                                    cache_dir=cache_dir)
+            f2 = _stage_exec.submit(analyze_git, repo_path)
+            f3 = _stage_exec.submit(collect_docs, repo_path)
 
             f1.add_done_callback(lambda f: _mark_done(f, t1, "Static analysis"))
             f2.add_done_callback(lambda f: _mark_done(f, t2, "Git history    "))
@@ -285,17 +286,27 @@ def analyze(
                 graph = f1.result()
             except Exception as exc:
                 console.print(f"\n[red]Error:[/red] Static analysis failed: {exc}")
+                _stage_exec.shutdown(wait=False, cancel_futures=True)
                 sys.exit(1)
             try:
                 history = f2.result()
             except Exception as exc:
                 console.print(f"\n[red]Error:[/red] Git analysis failed: {exc}")
+                _stage_exec.shutdown(wait=False, cancel_futures=True)
                 sys.exit(1)
             try:
                 corpus = f3.result()
             except Exception as exc:
                 console.print(f"\n[red]Error:[/red] Doc collection failed: {exc}")
+                _stage_exec.shutdown(wait=False, cancel_futures=True)
                 sys.exit(1)
+            _stage_exec.shutdown(wait=True)
+        except KeyboardInterrupt:
+            _stage_exec.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception:
+            _stage_exec.shutdown(wait=False, cancel_futures=True)
+            raise
 
     _parallel_total = _time.monotonic() - _parallel_start
     console.print(f"  [dim]Parallel wall time: {_fmt_elapsed(_parallel_total)}[/dim]")
@@ -349,80 +360,93 @@ def analyze(
     if serve:
         _serve_proc = _start_serve(output)
 
-    # -----------------------------------------------------------------------
-    # Stage 4: Narrative generation
-    # -----------------------------------------------------------------------
-    _step("Stage 4 -- LLM narrative generation")
-    from onboard.stages.narrative_gen import generate_guide
+    try:
+        # -----------------------------------------------------------------------
+        # Stage 4: Narrative generation
+        # -----------------------------------------------------------------------
+        _step("Stage 4 -- LLM narrative generation")
+        from onboard.stages.narrative_gen import generate_guide
 
-    # Handle --retry-failed
-    only_paths: Optional[list[str]] = None
-    if retry_failed:
-        only_paths = _find_failed_modules(output)
-        if not only_paths:
-            console.print("  [yellow]No failed narratives found — nothing to retry.[/yellow]")
+        # Handle --retry-failed
+        only_paths: Optional[list[str]] = None
+        if retry_failed:
+            only_paths = _find_failed_modules(output)
+            if not only_paths:
+                console.print("  [yellow]No failed narratives found — nothing to retry.[/yellow]")
+            else:
+                console.print(
+                    f"  Retrying [cyan]{len(only_paths)}[/cyan] failed module(s): "
+                    + ", ".join(only_paths[:5])
+                    + ("..." if len(only_paths) > 5 else "")
+                )
+
+        # When retry-failed found nothing to retry, skip stage 4 entirely.
+        # (only_paths=[] is falsy — generate_guide would silently run a full generation)
+        _nothing_to_retry = retry_failed and only_paths is not None and len(only_paths) == 0
+
+        if skip_llm or _nothing_to_retry:
+            if skip_llm:
+                console.print("  [yellow]--skip-llm set; using stub narratives.[/yellow]")
+            guide = stub_guide
         else:
             console.print(
-                f"  Retrying [cyan]{len(only_paths)}[/cyan] failed module(s): "
-                + ", ".join(only_paths[:5])
-                + ("..." if len(only_paths) > 5 else "")
+                f"  Provider: [cyan]{provider}[/cyan]  "
+                f"Model: [cyan]{model}[/cyan]  "
+                f"Tier: [cyan]{model_tier}[/cyan]"
             )
 
-    # When retry-failed found nothing to retry, skip stage 4 entirely.
-    # (only_paths=[] is falsy — generate_guide would silently run a full generation)
-    _nothing_to_retry = retry_failed and only_paths is not None and len(only_paths) == 0
+            # Progressive callback: write each module page as soon as it's done
+            # mkdocs serve picks up the change via its file-watcher automatically
+            def _on_module_done(path: str, narrative) -> None:
+                try:
+                    update_module_page(narrative, graph, output / "docs" / "modules")
+                except Exception:
+                    pass
 
-    if skip_llm or _nothing_to_retry:
-        if skip_llm:
-            console.print("  [yellow]--skip-llm set; using stub narratives.[/yellow]")
-        guide = stub_guide
-    else:
-        console.print(
-            f"  Provider: [cyan]{provider}[/cyan]  "
-            f"Model: [cyan]{model}[/cyan]  "
-            f"Tier: [cyan]{model_tier}[/cyan]"
-        )
+            guide = generate_guide(
+                graph=graph,
+                history=history,
+                corpus=corpus,
+                repo_path=repo_path,
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                max_modules=max_modules,
+                console=console,
+                module_done_callback=_on_module_done,
+                only_paths=only_paths,
+            )
 
-        # Progressive callback: write each module page as soon as it's done
-        # mkdocs serve picks up the change via its file-watcher automatically
-        def _on_module_done(path: str, narrative) -> None:
+        console.print(f"  Modules narrated: [cyan]{len(guide.modules)}[/cyan]")
+
+        # -----------------------------------------------------------------------
+        # Final site rebuild (updates index, guided tour, arc42, etc.)
+        # -----------------------------------------------------------------------
+        _step("Final site rebuild")
+        build_site(guide=guide, graph=graph, output_dir=output, site_name=site_name)
+        console.print(f"\n[green]Done![/green] Guide written to [bold]{output}[/bold]")
+        console.print(f"   [dim]cd {output} && mkdocs serve[/dim]\n")
+
+        if _serve_proc is not None:
             try:
-                update_module_page(narrative, graph, output / "docs" / "modules")
-            except Exception:
-                pass
+                _serve_proc.wait()
+            except KeyboardInterrupt:
+                _serve_proc.terminate()
+        elif serve:
+            # --serve was set but _start_serve failed (mkdocs not found) — already warned
+            pass
 
-        guide = generate_guide(
-            graph=graph,
-            history=history,
-            corpus=corpus,
-            repo_path=repo_path,
-            provider=provider,
-            api_key=api_key,
-            model=model,
-            max_modules=max_modules,
-            console=console,
-            module_done_callback=_on_module_done,
-            only_paths=only_paths,
-        )
-
-    console.print(f"  Modules narrated: [cyan]{len(guide.modules)}[/cyan]")
-
-    # -----------------------------------------------------------------------
-    # Final site rebuild (updates index, guided tour, arc42, etc.)
-    # -----------------------------------------------------------------------
-    _step("Final site rebuild")
-    build_site(guide=guide, graph=graph, output_dir=output, site_name=site_name)
-    console.print(f"\n[green]Done![/green] Guide written to [bold]{output}[/bold]")
-    console.print(f"   [dim]cd {output} && mkdocs serve[/dim]\n")
-
-    if _serve_proc is not None:
-        try:
-            _serve_proc.wait()
-        except KeyboardInterrupt:
+    except KeyboardInterrupt:
+        # Ctrl+C during stage 4 or final rebuild — kill the serve process immediately
+        if _serve_proc is not None:
             _serve_proc.terminate()
-    elif serve:
-        # --serve was set but _start_serve failed (mkdocs not found) — already warned
-        pass
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(1)
+    except Exception:
+        # Unexpected error — still kill the serve process so it doesn't linger
+        if _serve_proc is not None:
+            _serve_proc.terminate()
+        raise
 
 
 @main.command()

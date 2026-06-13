@@ -957,9 +957,10 @@ def generate_guide(
     raw_results: dict[str, ModuleNarrative] = {}
     done_count = 0
 
-    with ThreadPoolExecutor(max_workers=_LLM_MAX_CONCURRENT) as executor:
+    _mod_exec = ThreadPoolExecutor(max_workers=_LLM_MAX_CONCURRENT)
+    try:
         future_map = {
-            executor.submit(
+            _mod_exec.submit(
                 _generate_module,
                 path, graph, history, corpus,
                 provider, api_key, model, max_tokens, repo_path,
@@ -983,6 +984,13 @@ def generate_guide(
                     module_done_callback(path, narrative)
                 except Exception:
                     pass
+        _mod_exec.shutdown(wait=True)
+    except KeyboardInterrupt:
+        _mod_exec.shutdown(wait=False, cancel_futures=True)
+        raise
+    except Exception:
+        _mod_exec.shutdown(wait=False, cancel_futures=True)
+        raise
 
     # Restore reading order and assign index
     for idx, path in enumerate(modules_to_process):
@@ -1003,24 +1011,25 @@ def generate_guide(
     log("Generating architecture documents (parallel)...")
     overview_prompt = _build_overview_prompt(graph, history, corpus, modules_to_process)
 
-    with ThreadPoolExecutor(max_workers=5) as arch_exec:
-        f_overview = arch_exec.submit(
+    _arch_exec = ThreadPoolExecutor(max_workers=5)
+    try:
+        f_overview = _arch_exec.submit(
             _call_llm, overview_prompt, provider, api_key, model, max_tokens
         )
-        f_arc42 = arch_exec.submit(
+        f_arc42 = _arch_exec.submit(
             _generate_arc42,
             graph, history, corpus, tech, modules_to_process[:20],
             provider, api_key, model, max_tokens,
         )
-        f_domain = arch_exec.submit(
+        f_domain = _arch_exec.submit(
             _generate_domain_model,
             graph, tech, provider, api_key, model, max_tokens,
         )
-        f_dfd = arch_exec.submit(
+        f_dfd = _arch_exec.submit(
             _generate_dfd,
             graph, tech, provider, api_key, model, max_tokens,
         )
-        f_c4 = arch_exec.submit(
+        f_c4 = _arch_exec.submit(
             _generate_c4_components,
             graph, provider, api_key, model, max_tokens,
         )
@@ -1067,6 +1076,14 @@ def generate_guide(
             err_msg = str(e).replace(api_key, "***") if api_key else str(e)
             guide.dir_c4_components = {}
             log(f"  [warning] C4 components: {err_msg}")
+
+        _arch_exec.shutdown(wait=True)
+    except KeyboardInterrupt:
+        _arch_exec.shutdown(wait=False, cancel_futures=True)
+        raise
+    except Exception:
+        _arch_exec.shutdown(wait=False, cancel_futures=True)
+        raise
 
     # ── Guided tour ───────────────────────────────────────────────────────
     guide.guided_tour = _build_guided_tour(guide, graph, history)
